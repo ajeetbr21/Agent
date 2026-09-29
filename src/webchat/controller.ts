@@ -10,6 +10,7 @@ import type {
   ChatModelPayload,
   ChatNavigatePayload,
   ChatPromptPayload,
+  ProvidersSyncPayload,
   ChatStreamDeltaPayload,
   ChatStreamDonePayload,
   ChatTogglePayload
@@ -37,7 +38,14 @@ import { buildIndexPrimedNote, planIndexChunks } from "../prompt/indexChunker";
 import { collectActiveEditorContext } from "../workspace/context";
 import { applyAgentFileChanges, type AppliedAgentChange } from "../workspace/applyAgentChanges";
 import { openAppliedDiffs, previewAgentFileChanges } from "../workspace/previewAgentChanges";
-import { getProvider, listProviders } from "../providers/registry";
+import {
+  findProviderByHost,
+  getProvider,
+  listCustomAdapters,
+  listProviders,
+  setCustomProviders
+} from "../providers/registry";
+import { normalizeId, type CustomProviderConfig } from "../providers/custom";
 import type { WebChatProvider } from "../providers/types";
 import type { PromptFile } from "../prompt/types";
 import {
@@ -118,6 +126,7 @@ export class WebChatController implements vscode.Disposable {
     streamDone: new vscode.EventEmitter<{ turnId?: string; displayText: string; responseTokens: number }>(),
     cancelled: new vscode.EventEmitter<{ turnId?: string }>(),
     sessions: new vscode.EventEmitter<readonly SessionInfo[]>(),
+    providers: new vscode.EventEmitter<readonly ProviderInfo[]>(),
     assistantParsed: new vscode.EventEmitter<{
       turnId?: string;
       summary: string;
@@ -139,6 +148,7 @@ export class WebChatController implements vscode.Disposable {
   readonly onStreamDone = this.emitters.streamDone.event;
   readonly onCancelled = this.emitters.cancelled.event;
   readonly onSessions = this.emitters.sessions.event;
+  readonly onProviders = this.emitters.providers.event;
   readonly onAssistantParsed = this.emitters.assistantParsed.event;
   readonly onApplyResult = this.emitters.applyResult.event;
   readonly onCommandOutput = this.emitters.commandOutput.event;
@@ -196,11 +206,17 @@ export class WebChatController implements vscode.Disposable {
     this.bridgeSessionId =
       context.globalState.get<string>("webchat.bridge.sessionId") || randomUUID();
     void context.globalState.update("webchat.bridge.sessionId", this.bridgeSessionId);
+    this.loadCustomProviders(false);
 
     this.disposables.push(
       vscode.window.onDidChangeActiveTextEditor(() => this.emitContext()),
       vscode.window.onDidChangeTextEditorSelection(() => this.emitContext()),
       vscode.workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration("webchat.customProviders")) {
+          this.loadCustomProviders(true);
+          this.emitters.providers.fire(this.getProvidersInfo());
+          this.syncCustomProvidersToBrowser();
+        }
         if (event.affectsConfiguration("webchat")) {
           this.emitters.settings.fire(this.getSettings());
           this.emitters.usage.fire(this.getUsageInfo());
@@ -563,7 +579,12 @@ export class WebChatController implements vscode.Disposable {
   private handleBridgeMessage(message: BridgeEnvelope): void {
     this.output.appendLine(`[${message.type}] ${JSON.stringify(message.payload)}`);
 
-    if (message.type === "pair.request" || message.type === "bridge.status") {
+    if (message.type === "pair.request") {
+      this.pollStatus();
+      this.syncCustomProvidersToBrowser(); // a (re)connected browser needs the custom AI sites
+      return;
+    }
+    if (message.type === "bridge.status") {
       this.pollStatus();
       return;
     }
@@ -911,6 +932,65 @@ export class WebChatController implements vscode.Disposable {
   }
 
   // ---- providers + settings --------------------------------------------------------------------
+  /** (Re)read `webchat.customProviders` into the registry, surfacing invalid entries. */
+  private loadCustomProviders(announce: boolean): void {
+    const raw = vscode.workspace.getConfiguration("webchat").get<unknown>("customProviders", []);
+    const errors = setCustomProviders(raw);
+    for (const error of errors) {
+      this.output.appendLine(`Custom AI site skipped — ${error}`);
+    }
+    if (announce && errors.length > 0) {
+      this.emitters.notice.fire({ level: "warn", message: `Custom AI site skipped — ${errors[0]}` });
+    }
+  }
+
+  /** Tell the browser extension which custom sites to run on (it asks the user for access). */
+  private syncCustomProvidersToBrowser(): void {
+    if (!this.bridge?.getStatus().running) {
+      return;
+    }
+    this.bridge.sendToBrowsers(createEnvelope<ProvidersSyncPayload>({
+      id: randomUUID(),
+      sessionId: this.bridgeSessionId,
+      type: "providers.sync",
+      payload: { customProviders: listCustomAdapters() }
+    }));
+  }
+
+  /** Add a user-defined AI site (label + URL; selectors are optional and can be picked in the browser). */
+  async addCustomProvider(label: string, url: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration("webchat");
+    const current = config.get<CustomProviderConfig[]>("customProviders", []) ?? [];
+    const next = [...current, { label: label.trim(), url: url.trim() }];
+    const errors = setCustomProviders(next);
+    if (errors.length > 0) {
+      this.loadCustomProviders(false); // restore the registry from the unchanged setting
+      this.emitters.notice.fire({ level: "error", message: errors[errors.length - 1] });
+      return;
+    }
+    // Application scope: custom sites are a per-user choice, never picked up from a repo's settings.
+    await config.update("customProviders", next, vscode.ConfigurationTarget.Global);
+    this.emitters.notice.fire({
+      level: "info",
+      message: `Added “${label.trim()}”. In the browser, open the WebChat Bridge options page and click “Allow” for it.`
+    });
+  }
+
+  async removeCustomProvider(id: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration("webchat");
+    const current = config.get<CustomProviderConfig[]>("customProviders", []) ?? [];
+    const next = current.filter((entry) => {
+      const entryId = typeof entry?.id === "string" && entry.id.trim()
+        ? normalizeId(entry.id)
+        : safeHostId(entry?.url);
+      return entryId !== id;
+    });
+    await config.update("customProviders", next, vscode.ConfigurationTarget.Global);
+    if (this.getString("defaultProvider", "chatgpt") === id) {
+      await this.updateSetting("defaultProvider", "chatgpt");
+    }
+  }
+
   getProvidersInfo(): readonly ProviderInfo[] {
     return listProviders().map((provider) => ({
       id: provider.id,
@@ -919,7 +999,9 @@ export class WebChatController implements vscode.Disposable {
       tags: provider.tags,
       imageSupport: provider.imageSupport,
       models: this.getProviderModels(provider.id),
-      features: provider.features
+      features: provider.features,
+      custom: provider.custom,
+      chatUrl: provider.custom ? provider.chatUrl : undefined
     }));
   }
 
@@ -1073,9 +1155,7 @@ export class WebChatController implements vscode.Disposable {
     } catch {
       return;
     }
-    const provider = listProviders().find(
-      (p) => parsed.hostname === p.host || parsed.hostname.endsWith(`.${p.host}`)
-    );
+    const provider = findProviderByHost(parsed.hostname);
     if (!provider || !looksLikeConversationUrl(parsed)) {
       return;
     }
@@ -1143,13 +1223,11 @@ export class WebChatController implements vscode.Disposable {
       this.emitters.notice.fire({ level: "error", message: "Paste a full http(s) chat URL." });
       return;
     }
-    const provider = listProviders().find(
-      (p) => parsed.hostname === p.host || parsed.hostname.endsWith(`.${p.host}`)
-    );
+    const provider = findProviderByHost(parsed.hostname);
     if (!provider) {
       this.emitters.notice.fire({
         level: "warn",
-        message: `“${parsed.hostname}” isn't a supported chat provider. Use a ChatGPT/Claude/Gemini/Qwen/DeepSeek/AI Studio conversation URL.`
+        message: `“${parsed.hostname}” isn't a known chat provider. Add it under ⚙ Settings → Custom AI sites first, or use a ChatGPT/Claude/Gemini/Qwen/DeepSeek/AI Studio URL.`
       });
       return;
     }
@@ -2149,4 +2227,15 @@ function isDone(payload: unknown): payload is ChatStreamDonePayload {
     payload !== null &&
     typeof (payload as { fullText?: unknown }).fullText === "string"
   );
+}
+
+function safeHostId(url: unknown): string {
+  if (typeof url !== "string") {
+    return "";
+  }
+  try {
+    return normalizeId(new URL(url.trim()).hostname);
+  } catch {
+    return "";
+  }
 }

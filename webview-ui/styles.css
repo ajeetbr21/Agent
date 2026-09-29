@@ -1075,3 +1075,27 @@ body {
   flex: 1;
   min-width: 0;
 }
+
+/* Custom AI sites (Settings) */
+.custom-provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.custom-provider-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.custom-provider-name {
+  font-weight: 500;
+}
+.custom-provider-url {
+  flex: 1;
+  color: var(--wc-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

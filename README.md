@@ -113,6 +113,16 @@ This installs into your **existing editor** (current profile) — it does **not*
 
 > 🔐 The bridge only accepts connections that present the per-install pairing token, and refuses WebSocket/HTTP requests coming from web-page origins. `bridge.token` is an optional advanced override (≥ 24 chars; the old `webchat-dev-token` is rejected). If you change `bridge.port`, set the same port on the browser extension's options page. **LeechCode: Regenerate Bridge Pairing Token** rotates the token and disconnects every paired browser.
 
+## Using any other AI chat site
+
+Not limited to the built-ins — any web chat with a message box works:
+
+1. In the editor: ⚙ Settings → **Custom AI sites** → enter a name and the chat URL (e.g. `Z.ai`, `https://chat.z.ai/`) → **Add**. (Or edit `webchat.customProviders` in user settings.)
+2. In the browser: click the WebChat Bridge toolbar icon → under **Custom AI sites** click **Allow** for it (Chrome asks once per site).
+3. Pick it in the panel's provider dropdown and send as usual.
+
+The extension guesses the message box, the Send button (even icon-only ones) and the reply area. If it guesses wrong, right-click the correct element on that page → **WebChat Bridge** → *Use as chat input / Send button / assistant reply*. Picks are saved per site and can be reset on the options page. This also works for fixing a built-in provider after a redesign.
+
 ## When a provider changes its page
 
 Chat sites update their HTML often. Everything page-specific lives in **one file** — `browser-extension/src/content.js` — and **[docs/provider-adapters.md](docs/provider-adapters.md)** explains exactly which selector list to edit for each symptom (input not found, won't submit, no streaming, pop-up not dismissed, Stop, model switch), how to find a stable selector in DevTools in ~2 minutes, and how to reload. You can fix a provider yourself without waiting for a LeechCode update.

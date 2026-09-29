@@ -7,7 +7,12 @@
     "storage",
     "tabs",
     "alarms",
-    "offscreen"
+    "offscreen",
+    "scripting",
+    "contextMenus"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",

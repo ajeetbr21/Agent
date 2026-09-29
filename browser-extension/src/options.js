@@ -20,6 +20,8 @@ const clearButton = document.getElementById("clear");
 const message = document.getElementById("message");
 const statusBox = document.getElementById("status");
 const statusText = document.getElementById("status-text");
+const customList = document.getElementById("custom-list");
+const overrideList = document.getElementById("override-list");
 
 init();
 
@@ -28,6 +30,7 @@ async function init() {
   tokenInput.value = stored.bridgeToken || "";
   portInput.value = String(Number(stored.bridgePort) || DEFAULT_PORT);
   renderStatus(stored.bridgeStatus);
+  await renderCustomProviders();
   // Ask the offscreen socket for a fresh status in case storage is stale.
   chrome.runtime.sendMessage({ type: "webchat.offscreen.statusRequest" }).catch(() => {});
 }
@@ -35,6 +38,9 @@ async function init() {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.bridgeStatus) {
     renderStatus(changes.bridgeStatus.newValue);
+  }
+  if (area === "local" && (changes.customProviders || changes.selectorOverrides)) {
+    void renderCustomProviders();
   }
 });
 
@@ -83,4 +89,73 @@ function renderStatus(status) {
 function showMessage(text, kind) {
   message.textContent = text;
   message.dataset.kind = kind;
+}
+
+// ---- custom AI sites ------------------------------------------------------------------------------
+
+chrome.permissions.onAdded.addListener(() => void renderCustomProviders());
+chrome.permissions.onRemoved.addListener(() => void renderCustomProviders());
+
+async function renderCustomProviders() {
+  const { customProviders = [], selectorOverrides = {} } =
+    await chrome.storage.local.get(["customProviders", "selectorOverrides"]);
+
+  customList.replaceChildren();
+  if (customProviders.length === 0) {
+    customList.append(listItem("None yet — add one in the editor (⚙ Settings → Custom AI sites) while this browser is connected."));
+  }
+  for (const site of customProviders) {
+    const granted = await chrome.permissions.contains({ origins: [site.matchPattern] });
+    const item = listItem(`${site.label} — ${site.host}`);
+    const badge = document.createElement("span");
+    badge.className = granted ? "badge ok" : "badge warn";
+    badge.textContent = granted ? "allowed" : "needs access";
+    item.append(badge);
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = granted ? "secondary" : "";
+    button.textContent = granted ? "Revoke" : "Allow";
+    button.addEventListener("click", async () => {
+      // permissions.request must run directly inside a user gesture.
+      if (granted) {
+        await chrome.permissions.remove({ origins: [site.matchPattern] });
+      } else {
+        const ok = await chrome.permissions.request({ origins: [site.matchPattern] });
+        showMessage(ok ? `Access granted for ${site.host}. Open or reload its tab.` : "Access was not granted.", ok ? "ok" : "error");
+      }
+      await renderCustomProviders();
+    });
+    item.append(button);
+    customList.append(item);
+  }
+
+  overrideList.replaceChildren();
+  for (const [host, picks] of Object.entries(selectorOverrides)) {
+    const roles = Object.entries(picks).filter(([, selector]) => selector);
+    if (roles.length === 0) {
+      continue;
+    }
+    const item = listItem(`${host}: ${roles.map(([role, selector]) => `${role} → ${selector}`).join(" · ")}`);
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.className = "secondary";
+    reset.textContent = "Reset";
+    reset.addEventListener("click", async () => {
+      const { selectorOverrides: all = {} } = await chrome.storage.local.get("selectorOverrides");
+      delete all[host];
+      await chrome.storage.local.set({ selectorOverrides: all });
+    });
+    item.append(reset);
+    overrideList.append(item);
+  }
+}
+
+function listItem(text) {
+  const item = document.createElement("li");
+  const label = document.createElement("span");
+  label.className = "custom-label";
+  label.textContent = text;
+  item.append(label);
+  return item;
 }

@@ -38,6 +38,20 @@
         <p id="message" class="message" role="status"></p>
       </form>
 
+      <section>
+        <h2>Custom AI sites</h2>
+        <p class="hint">
+          Sites added in the editor under ⚙ Settings → <em>Custom AI sites</em> appear here. Chrome needs your
+          permission once per site before the extension can type into it.
+        </p>
+        <ul id="custom-list" class="custom-list"></ul>
+        <p class="hint">
+          If a site's message box, Send button or replies aren't found, right-click the correct element on that page →
+          <strong>WebChat Bridge</strong> → <em>Use as chat input / Send button / assistant reply</em>.
+        </p>
+        <ul id="override-list" class="custom-list"></ul>
+      </section>
+
       <p class="hint">
         The token is stored only in this browser profile (<code>chrome.storage.local</code>) and is sent only to
         <code>127.0.0.1</code>. Web pages cannot connect to the bridge — it accepts extension origins only.

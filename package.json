@@ -234,6 +234,26 @@
           "maximum": 500,
           "description": "Safety cap on the number of messages used to deliver a chunked codebase index. Files beyond this many messages are skipped."
         },
+        "webchat.customProviders": {
+          "type": "array",
+          "default": [],
+          "scope": "application",
+          "markdownDescription": "Extra web AI chat sites to drive, beyond the built-ins. Only `label` and `url` are required — the browser extension finds the input/send button/reply automatically, and you can fix a site by right-clicking an element → **WebChat Bridge**. Add sites from ⚙ Settings → Custom AI sites.",
+          "items": {
+            "type": "object",
+            "required": ["label", "url"],
+            "properties": {
+              "id": { "type": "string", "description": "Optional stable id (defaults to the hostname)." },
+              "label": { "type": "string", "description": "Name shown in the provider switcher." },
+              "url": { "type": "string", "description": "Chat page URL, e.g. https://chat.z.ai/ (https only; http allowed for localhost)." },
+              "inputSelector": { "type": "string", "description": "Optional CSS selector for the message box." },
+              "submitSelector": { "type": "string", "description": "Optional CSS selector for the Send button." },
+              "responseSelector": { "type": "string", "description": "Optional CSS selector matching each assistant reply." },
+              "maxMessageChars": { "type": "number", "description": "Per-message character limit (default 12000)." },
+              "maxSessionChars": { "type": "number", "description": "Per-conversation character budget (default 200000)." }
+            }
+          }
+        },
         "webchat.bridge.port": {
           "type": "number",
           "default": 53451,

@@ -91,3 +91,31 @@ button.secondary {
 .message { min-height: 1.2em; }
 .message[data-kind="error"] { color: #dc2626; }
 .message[data-kind="ok"] { color: #16a34a; }
+
+h2 {
+  font-size: 16px;
+  margin: 28px 0 4px;
+}
+.custom-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.custom-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.custom-label {
+  flex: 1;
+  word-break: break-all;
+}
+.badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+.badge.ok { background: rgba(22, 163, 74, 0.2); }
+.badge.warn { background: rgba(245, 158, 11, 0.25); }

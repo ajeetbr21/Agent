@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — custom AI sites
+
+- **Use any web AI chat:** ⚙ Settings → *Custom AI sites* (setting `webchat.customProviders`) adds any
+  chat URL as a provider. Only a name + URL are required.
+- Browser extension asks for access per site (options page → **Allow**) via optional host permissions
+  and registers its content script there at runtime; already-open tabs are injected on grant.
+- Generic detection for unknown sites, including unlabeled icon-only Send buttons next to the input.
+- Right-click → **WebChat Bridge** → *Use as chat input / Send button / assistant reply* saves a
+  per-site selector override (built-ins too); reset from the options page.
+- Prompts now go to a tab of the targeted provider's host instead of whichever provider tab was active.
+
 ## Unreleased — secure bridge pairing
 
 - **Security:** the bridge no longer uses the shared, public `webchat-dev-token`. Each install

@@ -200,7 +200,24 @@ const STOP_SELECTORS = [
   "button[aria-label*='Stop response']"
 ];
 
-const provider = providers.find((candidate) => candidate.hosts.includes(location.hostname));
+// Resolved asynchronously: a built-in adapter, or a user-defined custom AI site from storage.
+let provider = providers.find((candidate) => candidate.hosts.includes(location.hostname));
+/** Selectors picked on this site via the right-click menu; tried before everything else. */
+let selectorOverrides = {};
+/** The element under the last right-click, for the "Use as …" context-menu actions. */
+let lastContextTarget;
+// Generic reply containers used for custom sites when no selector is known yet.
+const CUSTOM_ASSISTANT_SELECTORS = [
+  "[data-message-author-role='assistant']",
+  "[data-role='assistant']",
+  "[data-author='assistant']",
+  "[class*='assistant' i] [class*='markdown' i]",
+  "[class*='markdown' i]",
+  ".prose",
+  "[class*='message-content' i]",
+  "[class*='response' i]",
+  "article"
+];
 let latestAssistantText = "";
 let lastDoneText = "";
 let doneTimer;
@@ -254,7 +271,57 @@ const NON_DISMISS_ACTION_TEXTS = [
   "see plans"
 ];
 
-if (provider) {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "webchat.ping") {
+    sendResponse({ ok: true, providerId: provider?.id });
+    return false;
+  }
+  if (message?.type === "webchat.pickElement") {
+    sendResponse(pickElement(message.role));
+    return false;
+  }
+  return false;
+});
+
+document.addEventListener("contextmenu", (event) => {
+  lastContextTarget = event.target instanceof Element ? event.target : undefined;
+}, true);
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.selectorOverrides) {
+    selectorOverrides = (changes.selectorOverrides.newValue || {})[location.hostname] || {};
+  }
+});
+
+void initProvider();
+
+async function initProvider() {
+  const stored = await chrome.storage.local.get(["customProviders", "selectorOverrides"]).catch(() => ({}));
+  selectorOverrides = (stored.selectorOverrides || {})[location.hostname] || {};
+
+  if (!provider) {
+    const custom = (stored.customProviders || []).find((candidate) =>
+      location.hostname === candidate.host || location.hostname.endsWith(`.${candidate.host}`)
+    );
+    if (custom) {
+      provider = {
+        id: custom.id,
+        label: custom.label,
+        hosts: [custom.host],
+        custom: true,
+        inputSelectors: custom.inputSelectors || [],
+        submitSelectors: custom.submitSelectors || [],
+        assistantSelectors: [...(custom.assistantSelectors || []), ...CUSTOM_ASSISTANT_SELECTORS]
+      };
+    }
+  }
+
+  if (provider) {
+    startProvider();
+  }
+}
+
+function startProvider() {
   sendState("ready", `${provider.label} page detected`);
   setInterval(() => {
     chrome.runtime.sendMessage({
@@ -397,6 +464,7 @@ function scheduleDone(fullText) {
 
 function findPromptInput() {
   const selectors = uniqueSelectors([
+    selectorOverrides.input,
     ...(provider.inputSelectors || []),
     ...FALLBACK_INPUT_SELECTORS
   ]);
@@ -499,6 +567,61 @@ async function waitForGenerationIdle(timeoutMs = 90000) {
 }
 
 function findSubmitButton() {
+  // A Send button picked on this page wins outright (it needn't be labelled "send").
+  if (selectorOverrides.submit) {
+    const picked = [...document.querySelectorAll(selectorOverrides.submit)].find((candidate) =>
+      isVisible(candidate) && !candidate.disabled && !looksLikeStopControl(candidate)
+    );
+    if (picked) {
+      return picked;
+    }
+  }
+
+  const labelled = findLabelledSubmitButton();
+  if (labelled || !provider.custom) {
+    return labelled;
+  }
+  return findNearbySubmitButton(findPromptInput());
+}
+
+function looksLikeStopControl(candidate) {
+  const label = `${candidate.getAttribute("aria-label") || ""} ${candidate.textContent || ""}`.toLowerCase();
+  const testId = (candidate.getAttribute("data-testid") || "").toLowerCase();
+  return testId.includes("stop") || label.includes("stop") || label.includes("cancel");
+}
+
+// Buttons near an input that are clearly NOT "send" (attachments, voice, menus…).
+const NON_SEND_HINTS = ["attach", "upload", "file", "image", "photo", "voice", "mic", "record", "menu", "more", "model", "search", "tool", "setting", "option", "emoji", "stop", "cancel", "close"];
+
+/**
+ * Custom sites often use an unlabeled icon button for Send. Walk up from the input and take the
+ * last enabled, visible button in the nearest container that doesn't look like another control —
+ * Send is conventionally the right-most/last button of the composer.
+ */
+function findNearbySubmitButton(input) {
+  let container = input?.parentElement;
+  for (let depth = 0; container && depth < 6; depth += 1, container = container.parentElement) {
+    const candidates = [...container.querySelectorAll("button, [role='button']")].filter((candidate) => {
+      if (!isVisible(candidate) || candidate.disabled || candidate.getAttribute("aria-disabled") === "true") {
+        return false;
+      }
+      const hint = [
+        candidate.getAttribute("aria-label"),
+        candidate.getAttribute("title"),
+        candidate.getAttribute("data-testid"),
+        candidate.className,
+        candidate.textContent
+      ].join(" ").toLowerCase();
+      return !NON_SEND_HINTS.some((word) => hint.includes(word)) && !candidate.getAttribute("aria-haspopup");
+    });
+    if (candidates.length > 0) {
+      return candidates.at(-1);
+    }
+  }
+  return undefined;
+}
+
+function findLabelledSubmitButton() {
   const selectors = uniqueSelectors([
     ...(provider.submitSelectors || []),
     ...FALLBACK_SUBMIT_SELECTORS
@@ -879,6 +1002,7 @@ function sleep(ms) {
 
 function findLatestAssistantText() {
   const candidates = uniqueSelectors([
+    selectorOverrides.assistant,
     ...(provider.assistantSelectors || []),
     ...FALLBACK_ASSISTANT_SELECTORS
   ]);
@@ -897,4 +1021,123 @@ function findLatestAssistantText() {
 
 function uniqueSelectors(selectors) {
   return [...new Set(selectors.filter(Boolean))];
+}
+
+// ---- right-click "Use as …" picker ----------------------------------------------------------------
+const PICK_ROLES = {
+  input: "chat input",
+  submit: "Send button",
+  assistant: "assistant reply"
+};
+
+/** Save a selector for the right-clicked element as this site's input / Send button / reply. */
+function pickElement(role) {
+  if (!PICK_ROLES[role]) {
+    return { ok: false, error: "Unknown role." };
+  }
+  let element = lastContextTarget;
+  if (!element) {
+    return { ok: false, error: "Right-click the element first." };
+  }
+  if (role === "submit") {
+    element = element.closest("button, [role='button']") || element;
+  } else if (role === "input") {
+    element = element.closest("textarea, input, [contenteditable='true'], [role='textbox']") || element;
+  }
+
+  // Replies repeat, so their selector must match every reply — not just this one.
+  const selector = role === "assistant" ? buildRepeatingSelector(element) : buildUniqueSelector(element);
+  if (!selector) {
+    return { ok: false, error: "Couldn't build a stable selector for that element." };
+  }
+
+  void chrome.storage.local.get("selectorOverrides").then(({ selectorOverrides: all = {} }) => {
+    const forHost = { ...(all[location.hostname] || {}), [role]: selector };
+    return chrome.storage.local.set({ selectorOverrides: { ...all, [location.hostname]: forHost } });
+  });
+  selectorOverrides = { ...selectorOverrides, [role]: selector };
+  flashElement(element);
+  if (provider) {
+    sendState("ready", `Saved ${PICK_ROLES[role]} selector for ${location.hostname}: ${selector}`);
+  }
+  return { ok: true, selector, role };
+}
+
+function stableClasses(element) {
+  // Skip hashed/utility classes that change between deploys (css-1a2b3c, sc-xyz, jsx-123…).
+  return [...element.classList]
+    .filter((name) => /^[a-zA-Z][\w-]{2,40}$/.test(name) && !/\d{3,}|^(css|sc|jsx|tw|_)-/i.test(name))
+    .slice(0, 3);
+}
+
+function attributeSelector(element) {
+  for (const attribute of ["data-testid", "data-test-id", "data-role", "data-message-author-role", "aria-label", "name", "placeholder"]) {
+    const value = element.getAttribute(attribute);
+    if (value && value.length <= 80) {
+      return `${element.tagName.toLowerCase()}[${attribute}="${CSS.escape(value)}"]`;
+    }
+  }
+  return undefined;
+}
+
+function buildUniqueSelector(element) {
+  if (element.id && !/\d{4,}/.test(element.id)) {
+    const byId = `#${CSS.escape(element.id)}`;
+    if (document.querySelectorAll(byId).length === 1) {
+      return byId;
+    }
+  }
+  const byAttribute = attributeSelector(element);
+  if (byAttribute && document.querySelectorAll(byAttribute).length === 1) {
+    return byAttribute;
+  }
+  const classes = stableClasses(element);
+  const byClass = `${element.tagName.toLowerCase()}${classes.map((name) => `.${CSS.escape(name)}`).join("")}`;
+  if (classes.length > 0 && document.querySelectorAll(byClass).length === 1) {
+    return byClass;
+  }
+  return buildPathSelector(element);
+}
+
+function buildRepeatingSelector(element) {
+  // Climb to the nearest ancestor that looks like a per-message node (repeated siblings).
+  let node = element;
+  for (let depth = 0; node && node !== document.body && depth < 8; depth += 1, node = node.parentElement) {
+    const candidate = attributeSelector(node) ||
+      (stableClasses(node).length > 0
+        ? `${node.tagName.toLowerCase()}${stableClasses(node).map((name) => `.${CSS.escape(name)}`).join("")}`
+        : undefined);
+    if (candidate) {
+      const matches = document.querySelectorAll(candidate).length;
+      if (matches >= 1 && matches < 200) {
+        return candidate;
+      }
+    }
+  }
+  return buildPathSelector(element);
+}
+
+function buildPathSelector(element) {
+  const parts = [];
+  let node = element;
+  while (node && node.nodeType === Node.ELEMENT_NODE && node !== document.body && parts.length < 6) {
+    let part = node.tagName.toLowerCase();
+    const siblings = node.parentElement
+      ? [...node.parentElement.children].filter((child) => child.tagName === node.tagName)
+      : [];
+    if (siblings.length > 1) {
+      part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+    }
+    parts.unshift(part);
+    node = node.parentElement;
+  }
+  return parts.length > 0 ? parts.join(" > ") : undefined;
+}
+
+function flashElement(element) {
+  const previous = element.style.outline;
+  element.style.outline = "2px solid #16a34a";
+  setTimeout(() => {
+    element.style.outline = previous;
+  }, 1200);
 }

@@ -1,4 +1,6 @@
-export type ProviderId = "chatgpt" | "claude" | "gemini" | "qwen" | "deepseek" | "aistudio" | "mock";
+export type BuiltInProviderId = "chatgpt" | "claude" | "gemini" | "qwen" | "deepseek" | "aistudio" | "mock";
+/** Built-in ids, or any id of a user-defined custom AI site (webchat.customProviders). */
+export type ProviderId = BuiltInProviderId | (string & {});
 
 /** How generous the provider's image/vision handling is on a typical free/logged-in session. */
 export type ImageSupport = "unlimited" | "generous" | "limited" | "none";
@@ -31,4 +33,6 @@ export interface WebChatProvider {
    * in settings).
    */
   readonly maxSessionChars?: number;
+  /** True for user-defined sites from `webchat.customProviders`. */
+  readonly custom?: boolean;
 }

@@ -12,6 +12,9 @@ export interface ProviderInfo {
   readonly imageSupport?: string;
   readonly models?: readonly string[];
   readonly features?: readonly { id: string; label: string; icon?: string }[];
+  /** True for user-defined AI sites (webchat.customProviders). */
+  readonly custom?: boolean;
+  readonly chatUrl?: string;
 }
 
 export interface FileChangeInfo {
@@ -158,6 +161,8 @@ export type WebviewToHost =
   | { readonly type: "closeBrowser" }
   | { readonly type: "startBridge" }
   | { readonly type: "copyBridgeToken" }
+  | { readonly type: "addCustomProvider"; readonly label: string; readonly url: string }
+  | { readonly type: "removeCustomProvider"; readonly id: string }
   | { readonly type: "regenerateBridgeToken" }
   | { readonly type: "sessionAction"; readonly action: "compact" | "rotate" | "reset" }
   | { readonly type: "applyChanges"; readonly turnId?: string; readonly files: readonly FileChangeInfo[] }

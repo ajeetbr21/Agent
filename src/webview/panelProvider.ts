@@ -50,6 +50,7 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
       ),
       this.controller.onCancelled((info) => this.post({ type: "promptCancelled", turnId: info.turnId })),
       this.controller.onSessions((sessions) => this.post({ type: "sessions", sessions })),
+      this.controller.onProviders((providers) => this.post({ type: "providers", providers })),
       this.controller.onAssistantParsed((parsed) =>
         this.post({
           type: "assistantParsed",
@@ -114,6 +115,12 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
         return;
       case "startBridge":
         await this.controller.startBridge(false);
+        return;
+      case "addCustomProvider":
+        await this.controller.addCustomProvider(message.label, message.url);
+        return;
+      case "removeCustomProvider":
+        await this.controller.removeCustomProvider(message.id);
         return;
       case "copyBridgeToken":
         await this.controller.copyBridgeToken();

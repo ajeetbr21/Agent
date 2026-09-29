@@ -79,6 +79,13 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
       </Section>
 
+      <Section
+        title="Custom AI sites"
+        hint="Use any web AI chat, not just the built-ins. Add its chat page URL here, then allow it once in the browser extension's options page."
+      >
+        <CustomProviderEditor providers={providers} />
+      </Section>
+
       <Section title="Context window & budget" hint="Customize the token window before WebChat compacts or starts a fresh chat.">
         <ToggleField
           label="Chunk large codebase index"
@@ -209,6 +216,73 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
           </div>
         </div>
       </Section>
+    </div>
+  );
+}
+
+/** List, add and remove user-defined AI sites (persisted to webchat.customProviders). */
+function CustomProviderEditor({ providers }: { providers: readonly ProviderInfo[] }) {
+  const [label, setLabel] = useState("");
+  const [url, setUrl] = useState("");
+  const custom = providers.filter((provider) => provider.custom);
+  const canAdd = label.trim().length > 0 && /^https?:\/\/\S+$/i.test(url.trim());
+
+  const add = () => {
+    if (!canAdd) {
+      return;
+    }
+    post({ type: "addCustomProvider", label: label.trim(), url: url.trim() });
+    setLabel("");
+    setUrl("");
+  };
+
+  return (
+    <div className="field">
+      <div className="custom-provider-list">
+        {custom.map((provider) => (
+          <div className="custom-provider-row" key={provider.id}>
+            <span className="custom-provider-name">{provider.label}</span>
+            <span className="custom-provider-url">{provider.chatUrl ?? provider.host}</span>
+            <button
+              className="attach-remove"
+              title={`Remove ${provider.label}`}
+              onClick={() => post({ type: "removeCustomProvider", id: provider.id })}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+        {custom.length === 0 ? <span className="session-empty">no custom sites yet</span> : null}
+      </div>
+      <div className="model-add-row">
+        <input
+          type="text"
+          className="field-input"
+          placeholder="Name, e.g. Z.ai"
+          value={label}
+          onChange={(event) => setLabel(event.target.value)}
+        />
+        <input
+          type="text"
+          className="field-input"
+          placeholder="https://chat.z.ai/"
+          value={url}
+          onChange={(event) => setUrl(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              add();
+            }
+          }}
+        />
+        <button className="btn ghost" disabled={!canAdd} onClick={add}>
+          Add
+        </button>
+      </div>
+      <span className="field-hint">
+        The extension guesses the message box, Send button and reply area. If it guesses wrong on a site, right-click
+        the right element on that page → WebChat Bridge → “Use as chat input / Send button / reply”.
+      </span>
     </div>
   );
 }

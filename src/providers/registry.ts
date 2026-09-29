@@ -1,6 +1,7 @@
 import type { ProviderId, WebChatProvider } from "./types";
+import { parseCustomProviders, type CustomProviderAdapter } from "./custom";
 
-const providers: readonly WebChatProvider[] = [
+const builtInProviders: readonly WebChatProvider[] = [
   {
     id: "chatgpt",
     label: "ChatGPT",
@@ -85,10 +86,38 @@ const providers: readonly WebChatProvider[] = [
   }
 ];
 
+let customProviders: readonly WebChatProvider[] = [];
+let customAdapters: readonly CustomProviderAdapter[] = [];
+
+/**
+ * Replace the user-defined providers (from `webchat.customProviders`). Returns validation errors
+ * for entries that were skipped.
+ */
+export function setCustomProviders(raw: unknown): readonly string[] {
+  const result = parseCustomProviders(
+    raw,
+    new Set(builtInProviders.map((provider) => provider.id)),
+    new Set(builtInProviders.map((provider) => provider.host))
+  );
+  customProviders = result.providers;
+  customAdapters = result.adapters;
+  return result.errors;
+}
+
+export function listCustomAdapters(): readonly CustomProviderAdapter[] {
+  return customAdapters;
+}
+
 export function listProviders(): readonly WebChatProvider[] {
-  return providers;
+  return [...builtInProviders, ...customProviders];
 }
 
 export function getProvider(id: ProviderId | string): WebChatProvider | undefined {
-  return providers.find((provider) => provider.id === id);
+  return listProviders().find((provider) => provider.id === id);
+}
+
+/** Find the provider (built-in or custom) that owns a hostname, including subdomains. */
+export function findProviderByHost(hostname: string): WebChatProvider | undefined {
+  const host = hostname.toLowerCase();
+  return listProviders().find((provider) => host === provider.host || host.endsWith(`.${provider.host}`));
 }
