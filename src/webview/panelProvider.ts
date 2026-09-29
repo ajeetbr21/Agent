@@ -64,6 +64,16 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
       this.controller.onApplyResult((result) =>
         this.post({ type: "applyResult", applied: result.applied, error: result.error })
       ),
+      this.controller.onReviewResult((result) =>
+        this.post({
+          type: "reviewResult",
+          turnId: result.turnId,
+          reviewerLabel: result.reviewerLabel,
+          verdict: result.verdict,
+          summary: result.summary,
+          findings: result.findings
+        })
+      ),
       this.controller.onUndoResult((result) =>
         this.post({ type: "undoResult", turnId: result.turnId, reverted: result.reverted, remaining: result.remaining })
       ),
@@ -152,6 +162,15 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
         return;
       case "undoChanges":
         await this.controller.undoChanges(message.turnId);
+        return;
+      case "reviewChanges":
+        await this.controller.reviewChanges();
+        return;
+      case "applyReviewFindings":
+        await this.controller.applyReviewFindings();
+        return;
+      case "revertTaskCommits":
+        await vscode.commands.executeCommand("webchat.revertTaskCommits");
         return;
       case "runCommands":
         await this.controller.runCommands(message.turnId);

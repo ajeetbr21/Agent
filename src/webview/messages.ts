@@ -151,6 +151,14 @@ export type HostToWebview =
     }
   | { readonly type: "applyResult"; readonly applied: readonly FileChangeInfo[]; readonly error?: string }
   | {
+      readonly type: "reviewResult";
+      readonly turnId: string;
+      readonly reviewerLabel: string;
+      readonly verdict: string;
+      readonly summary: string;
+      readonly findings: readonly string[];
+    }
+  | {
       readonly type: "undoResult";
       readonly turnId: string;
       readonly reverted: readonly string[];
@@ -192,6 +200,9 @@ export type WebviewToHost =
   | { readonly type: "previewChanges"; readonly turnId?: string; readonly path?: string }
   | { readonly type: "skipChanges"; readonly turnId?: string }
   | { readonly type: "undoChanges"; readonly turnId?: string }
+  | { readonly type: "reviewChanges" }
+  | { readonly type: "applyReviewFindings" }
+  | { readonly type: "revertTaskCommits" }
   | { readonly type: "runCommands"; readonly turnId?: string }
   | { readonly type: "skipCommands"; readonly turnId?: string }
   | { readonly type: "cancelPrompt"; readonly turnId?: string }

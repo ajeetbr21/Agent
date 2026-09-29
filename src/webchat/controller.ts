@@ -37,6 +37,8 @@ import { buildCompactionPrompt } from "../prompt/compaction";
 import { buildPrompt } from "../prompt/buildPrompt";
 import { buildIndexPrimedNote, planIndexChunks } from "../prompt/indexChunker";
 import { isSecretFile, redactSecrets, redactionNote, secretFileNotice, SECRET_FILE_GLOBS } from "../prompt/redact";
+import * as git from "../workspace/gitWorkflow";
+import { buildFixPrompt, buildReviewPrompt, describeReview, readReviewOutcome, type ReviewOutcome } from "../agent/reviewPrompt";
 import { collectActiveEditorContext } from "../workspace/context";
 import {
   AgentChangeError,
@@ -193,6 +195,13 @@ export class WebChatController implements vscode.Disposable {
     applyResult: new vscode.EventEmitter<{ applied: readonly FileChangeInfo[]; error?: string }>(),
     commandOutput: new vscode.EventEmitter<{ command: string; output: string; exitCode: number }>(),
     undoResult: new vscode.EventEmitter<{ turnId: string; reverted: readonly string[]; remaining: number }>(),
+    reviewResult: new vscode.EventEmitter<{
+      turnId: string;
+      reviewerLabel: string;
+      verdict: string;
+      summary: string;
+      findings: readonly string[];
+    }>(),
     notice: new vscode.EventEmitter<{ level: "info" | "warn" | "error"; message: string }>()
   };
 
@@ -210,6 +219,7 @@ export class WebChatController implements vscode.Disposable {
   readonly onApplyResult = this.emitters.applyResult.event;
   readonly onCommandOutput = this.emitters.commandOutput.event;
   readonly onUndoResult = this.emitters.undoResult.event;
+  readonly onReviewResult = this.emitters.reviewResult.event;
   readonly onNotice = this.emitters.notice.event;
 
   private readonly output: vscode.OutputChannel;
@@ -250,6 +260,13 @@ export class WebChatController implements vscode.Disposable {
   /** Guard so one failed request triggers at most one failover. */
   private failoverInFlight = false;
   private failoverCount = 0;
+  /** Git branch/commits created for the current task, when the git safety net is on. */
+  private gitTask: git.GitWorkflowState | undefined;
+  /** Set while a review turn is in flight, so the reviewer's reply is never applied as edits. */
+  private reviewContext: { taskId: string; implementerId: string; reviewerId: string } | undefined;
+  private lastReview: { outcome: ReviewOutcome; reviewerId: string } | undefined;
+  /** Identifies the current user task (used for git commit trailers and review scoping). */
+  private taskId = randomUUID();
   /** Problems to report to the model with the next tool transcript (e.g. edits that didn't apply). */
   private pendingFeedback: string[] = [];
   /** One-off facts to tell the model on the next user turn (e.g. "the user undid your edits"). */
@@ -606,6 +623,10 @@ export class WebChatController implements vscode.Disposable {
       // A fresh user turn starts a new task: reset what we carry over on a provider switch.
       this.taskProgress = { objective: instruction.trim(), toolResults: [], errors: [], changedFiles: [], relevantFiles: [] };
       this.failoverCount = 0;
+      this.taskId = randomUUID();
+      this.gitTask = undefined;
+      this.lastReview = undefined;
+      await this.startGitTask(instruction.trim());
     }
     if (contextPaths && contextPaths.length > 0) {
       for (const path of contextPaths) {
@@ -837,6 +858,12 @@ export class WebChatController implements vscode.Disposable {
       nextSteps: response.nextSteps
     });
 
+    // A review turn is advisory: the reviewer must not edit files or run tools, whatever it replies.
+    if (this.reviewContext) {
+      await this.finishReview(response, turnId);
+      return;
+    }
+
     const mode = this.getAgentMode();
     const applyMode = this.getApplyMode();
 
@@ -930,6 +957,251 @@ export class WebChatController implements vscode.Disposable {
       });
     }
     return `${result.text}\n\n${redactionNote(result)}`;
+  }
+
+  // ---- git safety net --------------------------------------------------------------------------
+  /**
+   * Put a new task on its own branch so the user's own branch is never touched and the work can be
+   * reverted days later (unlike the in-memory undo stack). Never runs without permission when the
+   * working tree already has uncommitted changes.
+   */
+  private async startGitTask(objective: string): Promise<void> {
+    if (!this.getBool("git.autoBranch", false)) {
+      return;
+    }
+    try {
+      if (!(await git.available())) {
+        this.emitters.notice.fire({ level: "warn", message: "Git branch per task is on, but this folder is not a git repository." });
+        return;
+      }
+      if (!(await git.hasCommits())) {
+        this.emitters.notice.fire({ level: "warn", message: "Git branch per task needs at least one commit in the repository — make an initial commit first." });
+        return;
+      }
+
+      const status = await git.status();
+      if (!status.clean) {
+        const choice = await vscode.window.showWarningMessage(
+          `You have uncommitted changes in ${status.changed.length} file${status.changed.length === 1 ? "" : "s"}.`,
+          {
+            modal: true,
+            detail: `${status.changed.slice(0, 10).join("\n")}\n\nLeechCode can start this task on a new branch (your changes come along, uncommitted), or stay on ${status.branch ?? "the current branch"} and just commit what the agent changes.`
+          },
+          "New branch anyway",
+          "Stay on this branch"
+        );
+        if (choice === undefined) {
+          return; // dismissed: no branch, no commits — behave as if git integration were off
+        }
+        if (choice === "Stay on this branch") {
+          this.gitTask = { taskId: this.taskId, branch: status.branch ?? "(current)", startedFrom: status.branch, commits: 0 };
+          return;
+        }
+      }
+
+      const startedFrom = status.branch ?? (await git.currentBranch());
+      const branch = await git.createTaskBranch(
+        git.toBranchName(objective, this.getString("git.branchPrefix", "leechcode"))
+      );
+      this.gitTask = { taskId: this.taskId, branch, startedFrom, commits: 0 };
+      this.emitters.notice.fire({ level: "info", message: `Working on branch ${branch} (from ${startedFrom ?? "current"}).` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`Git branch setup skipped: ${message}`);
+      this.emitters.notice.fire({ level: "warn", message: `Could not create a task branch: ${message}` });
+    }
+  }
+
+  /** Commit exactly what the agent just changed, so every applied turn is recoverable from git. */
+  private async commitApplied(applied: readonly AppliedAgentChange[]): Promise<void> {
+    if (!this.gitTask || !this.getBool("git.autoCommit", true) || applied.length === 0) {
+      return;
+    }
+    try {
+      const message = git.toCommitMessage(
+        this.lastParsed?.response.summary || this.taskProgress.objective,
+        applied.map((change) => ({ path: change.path, action: change.action })),
+        this.taskId
+      );
+      const result = await git.commitPaths(applied.map((change) => change.path), message);
+      if (!result) {
+        return; // nothing to commit (ignored paths, or an edit that changed nothing)
+      }
+      this.gitTask.commits += 1;
+      this.emitters.notice.fire({
+        level: "info",
+        message: `Committed ${result.committed.length} file${result.committed.length === 1 ? "" : "s"} as ${result.hash} on ${this.gitTask.branch}.`
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`Could not commit agent changes: ${message}`);
+      this.emitters.notice.fire({ level: "warn", message: `Changes were applied but not committed: ${message}` });
+    }
+  }
+
+  /** Revert every commit LeechCode made for this task, keeping history (no reset, nothing lost). */
+  async revertTaskCommits(): Promise<void> {
+    try {
+      if (!(await git.available())) {
+        this.emitters.notice.fire({ level: "warn", message: "This folder is not a git repository." });
+        return;
+      }
+      const commits = await git.taskCommits(this.taskId);
+      if (commits.length === 0) {
+        this.emitters.notice.fire({ level: "info", message: "No commits from this task to revert (use Undo for uncommitted changes)." });
+        return;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        `Revert ${commits.length} commit${commits.length === 1 ? "" : "s"} from this task?`,
+        { modal: true, detail: `${commits.map((commit) => `${commit.hash} ${commit.subject}`).join("\n")}\n\nA revert commit is added; nothing is rewritten or lost.` },
+        "Revert"
+      );
+      if (choice !== "Revert") {
+        return;
+      }
+      const result = await git.revertCommits(commits.map((commit) => commit.hash));
+      if (result.conflict) {
+        this.emitters.notice.fire({
+          level: "error",
+          message: `Could not revert cleanly (${result.conflict}). The working tree was left unchanged — revert manually with git.`
+        });
+        return;
+      }
+      this.emitters.notice.fire({ level: "info", message: `Reverted ${result.reverted.length} commit${result.reverted.length === 1 ? "" : "s"} from this task.` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitters.notice.fire({ level: "error", message: `Revert failed: ${message}` });
+    }
+  }
+
+  // ---- second-opinion review -------------------------------------------------------------------
+  /**
+   * Ask a different provider to review the task's changes. The reviewer gets a fresh chat, the diff
+   * and the objective, and is told not to edit anything; its findings come back as a normal reply
+   * which is surfaced instead of applied. Afterwards the implementer provider is restored.
+   */
+  async reviewChanges(): Promise<void> {
+    if (this.reviewContext) {
+      this.emitters.notice.fire({ level: "info", message: "A review is already in progress." });
+      return;
+    }
+    const implementer = this.getCurrentProvider();
+    if (!implementer) {
+      return;
+    }
+    if (this.taskProgress.changedFiles.length === 0) {
+      this.emitters.notice.fire({ level: "info", message: "Nothing to review yet — no files were changed in this task." });
+      return;
+    }
+
+    const reviewerId = this.getString("review.provider", "") ||
+      chooseFailoverProvider(this.failoverCandidates(), implementer.id, this.providerHealth);
+    if (!reviewerId || reviewerId === implementer.id) {
+      this.emitters.notice.fire({
+        level: "warn",
+        message: "Set a different provider for reviews (webchat.review.provider) — a model cannot usefully review its own work."
+      });
+      return;
+    }
+
+    const diff = await this.collectTaskDiff();
+    const prompt = buildReviewPrompt({
+      objective: this.taskProgress.objective,
+      diff,
+      changedFiles: this.taskProgress.changedFiles,
+      implementerSummary: this.lastParsed?.response.summary || this.getStoredSummary(),
+      verification: this.taskProgress.toolResults.filter((result) => result.label.startsWith("$ ")).map((result) => result.label),
+      implementerLabel: implementer.label
+    });
+
+    this.reviewContext = { taskId: this.taskId, implementerId: implementer.id, reviewerId };
+    this.emitters.notice.fire({ level: "info", message: `Asking ${this.providerLabel(reviewerId)} to review these changes…` });
+    try {
+      await this.setProvider(reviewerId);
+      // A fresh chat: the reviewer must judge the diff, not inherit the implementer's context.
+      await this.dispatchPrompt(prompt, "rotate", undefined, false);
+    } catch (error) {
+      this.reviewContext = undefined;
+      await this.setProvider(implementer.id);
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitters.notice.fire({ level: "error", message: `Could not start the review: ${message}` });
+    }
+  }
+
+  /** Surface a review reply (never apply it) and hand the panel back to the implementer. */
+  private async finishReview(response: AgentResponse, turnId: string): Promise<void> {
+    const context = this.reviewContext;
+    this.reviewContext = undefined;
+    if (!context) {
+      return;
+    }
+
+    const outcome = readReviewOutcome(response.summary, response.nextSteps);
+    this.lastReview = { outcome, reviewerId: context.reviewerId };
+    const reviewerLabel = this.providerLabel(context.reviewerId);
+
+    this.emitters.reviewResult.fire({
+      turnId,
+      reviewerLabel,
+      verdict: outcome.verdict,
+      summary: outcome.summary,
+      findings: outcome.findings
+    });
+    this.emitters.notice.fire({
+      level: outcome.verdict === "changes" ? "warn" : "info",
+      message: `${describeReview(outcome, reviewerLabel)}${outcome.findings.length > 0 ? " Use “Send findings to the author” to have them fixed." : ""}`
+    });
+
+    if (response.files.length > 0 || response.tools.length > 0) {
+      this.output.appendLine(`Review from ${reviewerLabel} included ${response.files.length} edit(s)/${response.tools.length} tool(s); ignored (reviews are advisory).`);
+    }
+
+    await this.setProvider(context.implementerId); // back to the provider doing the work
+  }
+
+  /** Send the last review's findings to the implementer as a follow-up task. */
+  async applyReviewFindings(): Promise<void> {
+    if (!this.lastReview || this.lastReview.outcome.findings.length === 0) {
+      this.emitters.notice.fire({ level: "info", message: "No review findings to send." });
+      return;
+    }
+    const { outcome, reviewerId } = this.lastReview;
+    this.lastReview = undefined;
+    await this.dispatchPrompt(buildFixPrompt(outcome, this.providerLabel(reviewerId)), undefined, undefined, false);
+  }
+
+  /** Diff for the reviewer: from git when available, otherwise the changed files' current content. */
+  private async collectTaskDiff(): Promise<string> {
+    const maxChars = Math.max(2000, this.getNumber("review.maxDiffChars", 40000));
+    try {
+      if (await git.available()) {
+        const diff = await git.taskDiff(this.taskId, maxChars);
+        if (diff.trim()) {
+          return diff;
+        }
+      }
+    } catch (error) {
+      this.output.appendLine(`Could not build a git diff for review: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // No git (or nothing committed): send the changed files as they are now.
+    const root = vscode.workspace.workspaceFolders?.[0];
+    if (!root) {
+      return "";
+    }
+    const parts: string[] = [];
+    let used = 0;
+    for (const file of this.taskProgress.changedFiles) {
+      const content = await this.readWorkspaceText(root, file.path);
+      const block = `--- ${file.path} (${file.action}, full current content — no git diff available) ---\n${content ?? "(unreadable)"}`;
+      if (used + block.length > maxChars) {
+        parts.push(`…[${this.taskProgress.changedFiles.length - parts.length} more files omitted]`);
+        break;
+      }
+      parts.push(block);
+      used += block.length;
+    }
+    return parts.join("\n\n");
   }
 
   // ---- request lifecycle + provider failover ---------------------------------------------------
@@ -1345,6 +1617,7 @@ export class WebChatController implements vscode.Disposable {
       for (const change of applied) {
         this.taskProgress.changedFiles.push({ path: change.path, action: change.action });
       }
+      await this.commitApplied(applied);
       this.emitters.notice.fire({
         level: "info",
         message: `Applied ${applied.length} file change${applied.length === 1 ? "" : "s"}. Undo: /undo or the card's Undo button.`

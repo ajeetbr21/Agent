@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — git safety net and second-opinion review
+
+- **Branch + commit per task** (`webchat.git.autoBranch`, `webchat.git.autoCommit`,
+  `webchat.git.branchPrefix`): each task runs on `leechcode/<task>` and every applied turn is
+  committed — only the files the agent changed — with a message from the model's summary and a
+  `LeechCode-Task:` trailer. A dirty working tree is never committed or stashed silently: LeechCode
+  asks whether to branch anyway or stay put. **LeechCode: Revert This Task's Commits** reverts the
+  whole task (a revert commit, so later work is kept).
+- **Second-opinion review** (`/review`, the **Review** button, or *Review Changes With Another AI*):
+  the task's diff goes to a different provider in a fresh chat, which returns a verdict
+  (APPROVE / MINOR ISSUES / NEEDS CHANGES) and findings as a card. **Send findings to the author**
+  feeds them back to the implementer, telling it to verify each point against the real code.
+  A review is always advisory — edits or tools in a reviewer's reply are ignored.
+  Configure with `webchat.review.provider` / `webchat.review.maxDiffChars`.
+- Git commands now run through one hardened wrapper (`src/workspace/gitCli.ts`): no shell, repository
+  config neutralised, disabled in Restricted Mode.
+
 ## Unreleased — credentials never leave the machine
 
 - **Secret files are never read** (`.env*`, `*.pem`, `*.key`, keystores, `id_rsa`, `.npmrc`, `.netrc`,

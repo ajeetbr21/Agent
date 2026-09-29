@@ -141,6 +141,26 @@ Not limited to the built-ins — any web chat with a message box works:
 
 The extension guesses the message box, the Send button (even icon-only ones) and the reply area. If it guesses wrong, right-click the correct element on that page → **WebChat Bridge** → *Use as chat input / Send button / assistant reply*. Picks are saved per site and can be reset on the options page. This also works for fixing a built-in provider after a redesign.
 
+## Git safety net
+
+Turn on `webchat.git.autoBranch` and every task gets its own branch, so your own branch is never touched and the work survives closing the window (unlike the in-memory undo):
+
+1. You send a task → LeechCode creates `leechcode/add-login-form` from your current branch.
+2. Each applied turn is committed — **only the files the agent changed** — with a subject from the model's summary and a `LeechCode-Task:` trailer.
+3. Happy with it? Merge the branch as usual. Not happy? **LeechCode: Revert This Task's Commits** adds a revert commit (nothing is rewritten, later work is kept), or just delete the branch.
+
+If the working tree is dirty when a task starts, LeechCode asks first: new branch anyway, or stay on the current branch and only commit the agent's files. Uncommitted work is never committed, stashed or discarded behind your back. Commits skip hooks (`--no-verify`) so a long agent loop isn't blocked by a pre-commit check; run your hooks when you merge.
+
+## Second-opinion review (one AI checks another)
+
+`/review`, the **Review** button on an applied change, or **LeechCode: Review Changes With Another AI** sends the task's diff to a *different* provider:
+
+- the reviewer gets a fresh chat with the objective, the diff and the file list, and is told to make no edits;
+- its verdict (APPROVE / MINOR ISSUES / NEEDS CHANGES) and findings appear as a card in the chat;
+- **Send findings to the author** hands them back to the provider that wrote the code, which is told to verify each point against the real files first — a reviewer reading a diff can be wrong.
+
+Set the reviewer with `webchat.review.provider` (e.g. `claude` while `chatgpt` writes the code); empty picks another configured provider automatically. The reviewer's reply is always advisory: even if it returns edits or commands, they are ignored.
+
 ## Your secrets stay on your machine
 
 Everything LeechCode sends lands in a third-party web page, so credentials are held back in two layers (`webchat.privacy.redactSecrets`, on by default):

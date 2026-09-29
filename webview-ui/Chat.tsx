@@ -259,7 +259,58 @@ function MessageList({ messages, booted }: { messages: readonly ChatMessage[]; b
   );
 }
 
+/** A second AI's review of the task's changes: verdict, findings, and a way to act on them. */
+function ReviewCard({ message }: { message: ChatMessage }) {
+  const review = message.review;
+  if (!review) {
+    return null;
+  }
+  const verdictClass = review.verdict === "approve" ? "applied" : review.verdict === "changes" ? "error" : "";
+  const verdictLabel = review.verdict === "approve"
+    ? "approved"
+    : review.verdict === "changes"
+      ? "changes needed"
+      : review.verdict === "minor"
+        ? "minor issues"
+        : "reviewed";
+
+  return (
+    <div className="msg msg-system">
+      <div className="change-card">
+        <div className="change-head">
+          <span className="change-title">Review by {review.reviewerLabel}</span>
+          <span className={`change-status ${verdictClass}`}>{verdictLabel}</span>
+        </div>
+        <p className="review-summary">{review.summary}</p>
+        {review.findings.length > 0 ? (
+          <ol className="review-findings">
+            {review.findings.map((finding, index) => (
+              <li key={`${index}-${finding.slice(0, 24)}`}>{finding}</li>
+            ))}
+          </ol>
+        ) : (
+          <span className="session-empty">No findings.</span>
+        )}
+        {review.findings.length > 0 ? (
+          <div className="change-actions">
+            <button
+              className="btn primary"
+              title="Send these findings to the assistant that wrote the code so it can fix them"
+              onClick={() => post({ type: "applyReviewFindings" })}
+            >
+              Send findings to the author
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function MessageItem({ message }: { message: ChatMessage }) {
+  if (message.kind === "review") {
+    return <ReviewCard message={message} />;
+  }
   if (message.kind === "command") {
     return (
       <div className="msg msg-system">
@@ -417,6 +468,13 @@ function FileChangeCard({ message }: { message: ChatMessage }) {
           >
             Undo
           </button>
+          <button
+            className="btn ghost"
+            title="Ask another AI to review this task's changes"
+            onClick={() => post({ type: "reviewChanges" })}
+          >
+            Review
+          </button>
         </div>
       ) : null}
       {showActions ? (
@@ -483,6 +541,7 @@ const SLASH_COMMANDS: { cmd: string; desc: string }[] = [
   { cmd: "plan", desc: "Plan mode — propose a plan, make no edits" },
   { cmd: "full", desc: "Full access — edit files & run commands with no approvals" },
   { cmd: "undo", desc: "Undo the agent's last file changes" },
+  { cmd: "review", desc: "Have another AI review this task's changes" },
   { cmd: "compact", desc: "Compact the session now" },
   { cmd: "clear", desc: "Reset the session (new chat)" },
   { cmd: "open", desc: "Open the chat tab in a browser" },
@@ -701,6 +760,9 @@ function Composer({
         break;
       case "undo":
         post({ type: "undoChanges" });
+        break;
+      case "review":
+        post({ type: "reviewChanges" });
         break;
       case "compact":
         post({ type: "sessionAction", action: "compact" });

@@ -26,7 +26,9 @@ export interface ChatMessage {
   changeStatus?: "pending" | "applied" | "skipped" | "error" | "reverted";
   commands?: readonly string[];
   commandStatus?: "pending" | "running" | "done";
-  kind?: "command";
+  kind?: "command" | "review";
+  /** Review card fields (kind === "review"). */
+  review?: { reviewerLabel: string; verdict: string; summary: string; findings: readonly string[] };
   exitCode?: number;
   /** Estimated token count for this message (prompt tokens for user, response tokens for assistant). */
   tokens?: number;
@@ -188,6 +190,22 @@ function reducer(state: State, action: Action): State {
           m.turnId === message.turnId && m.files && m.files.length > 0 ? { ...m, changeStatus: "reverted" } : m
         )
       };
+    case "reviewResult": {
+      const reviewMessage: ChatMessage = {
+        id: `review-${state.messages.length}-${Math.random().toString(36).slice(2, 7)}`,
+        role: "system",
+        kind: "review",
+        text: message.summary,
+        turnId: message.turnId,
+        review: {
+          reviewerLabel: message.reviewerLabel,
+          verdict: message.verdict,
+          summary: message.summary,
+          findings: message.findings
+        }
+      };
+      return { ...state, messages: [...state.messages, reviewMessage] };
+    }
     case "commandOutput": {
       const outputMessage: ChatMessage = {
         id: `cmd-${state.messages.length}-${Math.random().toString(36).slice(2, 7)}`,

@@ -84,6 +84,16 @@
         "category": "LeechCode"
       },
       {
+        "command": "webchat.reviewChanges",
+        "title": "Review Changes With Another AI",
+        "category": "LeechCode"
+      },
+      {
+        "command": "webchat.revertTaskCommits",
+        "title": "Revert This Task's Commits",
+        "category": "LeechCode"
+      },
+      {
         "command": "webchat.showRequestStatus",
         "title": "Show Request Status",
         "category": "LeechCode"
@@ -258,6 +268,32 @@
           "minimum": 1,
           "maximum": 500,
           "description": "Safety cap on the number of messages used to deliver a chunked codebase index. Files beyond this many messages are skipped."
+        },
+        "webchat.git.autoBranch": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Start each task on its own git branch (`leechcode/<task>`), so your own branch is untouched and the work can be reviewed or thrown away as a whole. If the working tree is dirty, LeechCode asks what to do first."
+        },
+        "webchat.git.autoCommit": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When a task branch is in use, commit each applied turn (only the files the agent changed) with a message from the model's summary. Makes every step recoverable with git, not just the in-memory undo."
+        },
+        "webchat.git.branchPrefix": {
+          "type": "string",
+          "default": "leechcode",
+          "description": "Prefix for task branches, e.g. \"leechcode\" → leechcode/add-login-form."
+        },
+        "webchat.review.provider": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Provider id used for second-opinion reviews (e.g. `claude` while `chatgpt` writes the code). Empty = pick another configured provider automatically. A model reviewing its own work is not useful."
+        },
+        "webchat.review.maxDiffChars": {
+          "type": "number",
+          "default": 40000,
+          "minimum": 2000,
+          "description": "Largest diff sent to a reviewer before it is truncated."
         },
         "webchat.privacy.redactSecrets": {
           "type": "boolean",
