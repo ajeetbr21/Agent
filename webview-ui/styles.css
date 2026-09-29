@@ -266,6 +266,9 @@ body {
 .change-status.applied {
   color: var(--vscode-testing-iconPassed, #3fb950);
 }
+.change-status.reverted {
+  color: var(--wc-muted);
+}
 .change-status.error {
   color: var(--vscode-testing-iconFailed, #f85149);
 }
@@ -302,6 +305,10 @@ body {
 .badge.delete {
   background: rgba(248, 81, 73, 0.18);
   color: var(--vscode-testing-iconFailed, #f85149);
+}
+.badge.edit {
+  background: rgba(56, 139, 253, 0.18);
+  color: var(--vscode-textLink-foreground, #388bfd);
 }
 .change-actions {
   display: flex;

@@ -64,6 +64,9 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
       this.controller.onApplyResult((result) =>
         this.post({ type: "applyResult", applied: result.applied, error: result.error })
       ),
+      this.controller.onUndoResult((result) =>
+        this.post({ type: "undoResult", turnId: result.turnId, reverted: result.reverted, remaining: result.remaining })
+      ),
       this.controller.onCommandOutput((out) =>
         this.post({ type: "commandOutput", command: out.command, output: out.output, exitCode: out.exitCode })
       ),
@@ -147,11 +150,14 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
       case "skipChanges":
         this.controller.skipChanges();
         return;
+      case "undoChanges":
+        await this.controller.undoChanges(message.turnId);
+        return;
       case "runCommands":
         await this.controller.runCommands(message.turnId);
         return;
       case "skipCommands":
-        this.controller.skipCommands();
+        this.controller.skipCommands(message.turnId);
         return;
       case "cancelPrompt":
         await this.controller.cancelPrompt(message.turnId);

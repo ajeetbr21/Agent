@@ -84,6 +84,11 @@
         "category": "LeechCode"
       },
       {
+        "command": "webchat.undoLastChanges",
+        "title": "Undo Last Agent Changes",
+        "category": "LeechCode"
+      },
+      {
         "command": "webchat.copyBridgeToken",
         "title": "Copy Bridge Pairing Token",
         "category": "LeechCode"
@@ -164,6 +169,7 @@
         "webchat.agent.mode": {
           "type": "string",
           "default": "ask",
+          "scope": "application",
           "enum": [
             "ask",
             "auto",
@@ -174,9 +180,23 @@
             "Ask: review a diff before applying edits, and approve any tool/command runs.",
             "Auto-edit: apply file changes automatically, but still approve tool/command runs.",
             "Plan: return a step-by-step plan only — no edits, no commands.",
-            "Bypass: full access — apply edits AND run tools/commands automatically, no prompts."
+            "Full access: apply edits AND run tools/commands automatically, no approvals (destructive commands still ask unless webchat.agent.confirmDangerousCommands is off). Every change can be undone."
           ],
-          "description": "Agent mode. Controls whether LeechCode asks before applying edits and running tools."
+          "description": "Agent mode. Controls whether LeechCode asks before applying edits and running tools. User-level only, so a repository's settings can't change it."
+        },
+        "webchat.agent.maxToolIterations": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 200,
+          "scope": "application",
+          "description": "How many tool rounds (read → edit → run → read…) the agent may do for one task before pausing. 0 = default (6, or 25 in full access)."
+        },
+        "webchat.agent.confirmDangerousCommands": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "In full access mode, still ask before running commands that look destructive: deleting a drive/home/parent folder, formatting disks, force-pushing, git reset --hard / clean -f, piping a downloaded script into a shell, sudo, shutdown."
         },
         "webchat.prompt.includeSelectionOnly": {
           "type": "boolean",

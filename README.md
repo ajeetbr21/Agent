@@ -92,8 +92,13 @@ This installs into your **existing editor** (current profile) — it does **not*
 | In the composer | What it does |
 | --- | --- |
 | `@somefile` | attach specific workspace files as context |
+| `@folder/` | attach every file in a folder (type part of its name) |
+| `@problems` | attach the Problems panel (compiler / linter errors and warnings) |
+| `@git` | attach `git status` + the uncommitted diff |
+| `@open` | attach every file open in the editor |
 | `@codebase` or `/index` | index the whole workspace (chunked automatically if too large) |
-| `/ask` `/auto` `/plan` | switch agent mode |
+| `/ask` `/auto` `/plan` `/full` | switch agent mode (`/full` = full access, no approvals) |
+| `/undo` | undo the agent's last file changes (also: the **Undo** button on a change card, or **LeechCode: Undo Last Agent Changes**) |
 | `/compact` `/clear` `/open` `/close` | compact session · reset · open/close the chat browser |
 | paste a screenshot / `＋` | attach images & files (optionally analyzed by your local vision model) |
 | `model…` dropdown | switch the model on the provider page |
@@ -107,9 +112,22 @@ This installs into your **existing editor** (current profile) — it does **not*
 | Ask | review diff, then apply | approve each batch |
 | Auto-edit | applied automatically | approve each batch |
 | Plan | none | read-only exploration only |
-| Bypass | applied automatically | run automatically |
+| Full access | applied automatically | run automatically — no approvals |
 
-**Key settings** (all under the `webchat.*` namespace, editable in the in-panel ⚙ Settings or VS Code settings): `defaultProvider`, `agent.mode`, `browser.autoSubmit`, `provider.maxMessageChars` / `provider.maxSessionChars` (per-provider windows), `index.chunked` / `index.maxChunks`, `context.maxIndexChars` / `context.maxTreeChars`, `diff.showOnApply`, `vision.*` (local image→text), `session.*` (budget / compaction / rotation), `bridge.port` / `bridge.token`.
+In every mode the agent can read the project on its own: `read_file`, `list_dir`, `search`, plus VS Code's view of it — `diagnostics` (Problems panel), `open_editors`, `git_status` / `git_diff`, `symbols` (find a class/function by name) and `references` (definition + all usages). It edits existing files with small find/replace **edits** instead of resending whole files; if an edit doesn't match, nothing from that response is written and the model is told why so it can retry.
+
+**Full access** lets the agent work on its own until the task is done: edit → run build/tests → check problems → fix, up to 25 tool rounds per task (`agent.maxToolIterations`). Safety nets:
+
+- every applied change can be undone (`/undo`, the card's **Undo**, 40 turns); undo asks before overwriting a file you changed afterwards;
+- the agent can never write inside `.git/` (a written `.git/config` or hook would run code behind your back), and the git tools run with the repository's own config neutralised and are disabled in Restricted Mode;
+- a response is applied only if *all* of its changes are valid, and a failure while writing rolls the files back;
+- commands that could destroy data outside the project — deleting a drive/home/parent folder, formatting disks, force-push, `git reset --hard`, `git clean -f`, `curl … | sh`, `sudo`, shutdown — still ask first (`agent.confirmDangerousCommands`);
+- it only runs in trusted folders (in Restricted Mode it behaves like Auto-edit), and the mode is a user setting, so a repository's `.vscode/settings.json` can't switch it on;
+- diff tabs aren't opened automatically in full access (use **View diff** on the card).
+
+> ⚠️ Full access means text coming from a web page decides which commands run on your computer. Use it on projects you have committed to git, and switch back to Ask for unfamiliar code.
+
+**Key settings** (all under the `webchat.*` namespace, editable in the in-panel ⚙ Settings or VS Code settings): `defaultProvider`, `agent.mode`, `agent.maxToolIterations`, `agent.confirmDangerousCommands`, `browser.autoSubmit`, `provider.maxMessageChars` / `provider.maxSessionChars` (per-provider windows), `index.chunked` / `index.maxChunks`, `context.maxIndexChars` / `context.maxTreeChars`, `diff.showOnApply`, `vision.*` (local image→text), `session.*` (budget / compaction / rotation), `bridge.port` / `bridge.token`.
 
 > 🔐 The bridge only accepts connections that present the per-install pairing token, and refuses WebSocket/HTTP requests coming from web-page origins. `bridge.token` is an optional advanced override (≥ 24 chars; the old `webchat-dev-token` is rejected). If you change `bridge.port`, set the same port on the browser extension's options page. **LeechCode: Regenerate Bridge Pairing Token** rotates the token and disconnects every paired browser.
 

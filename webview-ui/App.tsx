@@ -23,7 +23,7 @@ export interface ChatMessage {
   files?: readonly FileChangeInfo[];
   summary?: string;
   nextSteps?: readonly string[];
-  changeStatus?: "pending" | "applied" | "skipped" | "error";
+  changeStatus?: "pending" | "applied" | "skipped" | "error" | "reverted";
   commands?: readonly string[];
   commandStatus?: "pending" | "running" | "done";
   kind?: "command";
@@ -152,8 +152,10 @@ function reducer(state: State, action: Action): State {
       };
     case "assistantParsed": {
       const mode = state.settings?.agentMode ?? "ask";
+      // Only full access ("bypass") runs commands without approval; ask and auto-edit wait for the
+      // approval card (showing "running" in auto-edit left the card with no buttons, stuck).
       const commandStatus =
-        message.commands.length > 0 ? (mode === "auto" ? "running" : "pending") : undefined;
+        message.commands.length > 0 ? (mode === "bypass" ? "running" : "pending") : undefined;
       return {
         ...state,
         messages: updateAssistant(state.messages, message.turnId, (m) => ({
@@ -174,6 +176,17 @@ function reducer(state: State, action: Action): State {
       return {
         ...state,
         messages: markLatestPending(state.messages, message.error ? "error" : "applied")
+      };
+    case "undoResult":
+      // Only a full undo clears the card; a partial undo keeps it "applied" so the rest stays undoable.
+      if (message.remaining > 0 || message.reverted.length === 0) {
+        return state;
+      }
+      return {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.turnId === message.turnId && m.files && m.files.length > 0 ? { ...m, changeStatus: "reverted" } : m
+        )
       };
     case "commandOutput": {
       const outputMessage: ChatMessage = {

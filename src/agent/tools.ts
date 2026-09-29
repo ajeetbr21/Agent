@@ -1,6 +1,14 @@
 import * as vscode from "vscode";
 import type { AgentToolRequest } from "./toolProtocol";
 import { getWorkspaceRoot, resolveWorkspacePath } from "../workspace/applyAgentChanges";
+import {
+  collectDiagnostics,
+  collectOpenEditors,
+  findReferences,
+  findWorkspaceSymbols,
+  gitDiff,
+  gitStatus
+} from "./vscodeContext";
 
 const MAX_READ_CHARS = 20000;
 const MAX_DIR_ENTRIES = 300;
@@ -15,7 +23,7 @@ export interface ToolExecution {
   readonly ok: boolean;
 }
 
-/** Execute a single read-only tool (read_file / list_dir / search) safely within the workspace. */
+/** Execute a single read-only tool (files, search, and VS Code context) safely within the workspace. */
 export async function executeReadonlyTool(tool: AgentToolRequest): Promise<ToolExecution> {
   try {
     switch (tool.name) {
@@ -25,6 +33,18 @@ export async function executeReadonlyTool(tool: AgentToolRequest): Promise<ToolE
         return await listDirTool(tool.path);
       case "search":
         return await searchTool(tool.query, tool.glob);
+      case "diagnostics":
+        return { label: describeTool(tool), output: collectDiagnostics(tool.path), ok: true };
+      case "open_editors":
+        return { label: describeTool(tool), output: collectOpenEditors(), ok: true };
+      case "git_status":
+        return { label: describeTool(tool), output: await gitStatus(), ok: true };
+      case "git_diff":
+        return { label: describeTool(tool), output: await gitDiff(tool.path, tool.staged), ok: true };
+      case "symbols":
+        return { label: describeTool(tool), output: await findWorkspaceSymbols(tool.query), ok: true };
+      case "references":
+        return { label: describeTool(tool), output: await findReferences(tool.path, tool.symbol, tool.line), ok: true };
       default:
         return { label: `${tool.name}`, output: `Unsupported read-only tool: ${tool.name}`, ok: false };
     }
@@ -42,6 +62,18 @@ export function describeTool(tool: AgentToolRequest): string {
       return `list_dir ${tool.path || "."}`;
     case "search":
       return `search "${tool.query}"${tool.glob ? ` in ${tool.glob}` : ""}`;
+    case "diagnostics":
+      return `diagnostics ${tool.path ?? "(workspace)"}`;
+    case "open_editors":
+      return "open_editors";
+    case "git_status":
+      return "git_status";
+    case "git_diff":
+      return `git_diff${tool.staged ? " --staged" : ""}${tool.path ? ` ${tool.path}` : ""}`;
+    case "symbols":
+      return `symbols "${tool.query}"`;
+    case "references":
+      return `references ${tool.symbol} in ${tool.path}${tool.line ? `:${tool.line}` : ""}`;
     case "run":
       return `run ${tool.command}`;
     case "spawn_subagent":

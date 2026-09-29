@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased — full access, VS Code context, precise edits, undo
+
+- **Full access mode** (was "Bypass"): edits are applied and commands run with no approvals, with a
+  larger tool-loop budget (25 rounds per task, `agent.maxToolIterations`). `/full` switches to it.
+  Destructive commands (wiping drives/home/parent folders, formatting disks, force-push,
+  `git reset --hard`, `git clean -f`, `curl | sh`, `sudo`, shutdown) still ask first
+  (`agent.confirmDangerousCommands`). Downgrades to Auto-edit in untrusted folders. `agent.mode`,
+  `agent.maxToolIterations` and `agent.confirmDangerousCommands` are now user-level (application
+  scope) settings, so a repository can't enable full access.
+- **Undo:** every applied change can be undone — `/undo`, an **Undo** button on the change card, or
+  **LeechCode: Undo Last Agent Changes** (40 turns). Files you edited after the agent are only
+  overwritten after confirmation. The model is told what was undone.
+- **Precise edits:** new `edit` file action with find/replace (`findBase64`/`replaceBase64`), so large
+  files don't have to be resent whole. Keeps CRLF files CRLF, tolerates trailing-whitespace
+  differences, and refuses ambiguous matches. All changes in a response are validated before anything
+  is written; failures are reported back to the model in the same follow-up as the tool output.
+- **VS Code context tools** (read-only, run automatically): `diagnostics` (Problems panel),
+  `open_editors`, `git_status`, `git_diff`, `symbols` (workspace symbol search) and `references`
+  (definition + usages via the language server).
+- **More @-mentions:** `@problems`, `@git`, `@open` (all open editors) and `@folder/`.
+- **Fixed:** the command card showed "running" in Auto-edit (where commands wait for approval) and
+  "approve" in Bypass (where they already ran).
+- Full access no longer opens a diff tab for every applied change.
+- **Hardening found while reviewing this change:**
+  - the agent can no longer write inside `.git/` — a written `.git/config` (fsmonitor, external diff)
+    or hook would have made a later "read-only" git tool execute arbitrary commands with no approval;
+  - `git_status`/`git_diff` now run with the repository's config neutralised (`--no-ext-diff`,
+    `--no-textconv`, no fsmonitor/hooks/pager), stay inside the workspace folder (`-- .`,
+    `--literal-pathspecs`, pathspec magic refused) and are disabled in Restricted Mode;
+  - a repeated `chat.stream.done` for one reply no longer re-applies its edits or re-runs its tools;
+  - a failure part-way through writing now rolls back the files already written, instead of leaving a
+    partial apply that the model was told never happened;
+  - edits leave text outside the match byte-for-byte (mixed line endings survive) and refuse
+    non-UTF-8 files instead of corrupting them; truncated base64 is rejected;
+  - the Ask-mode preview uses the same planner as apply, so stacked edits to one file preview
+    correctly as a single diff;
+  - **View diff** works on older applied cards, a partial undo keeps the rest undoable, declined
+    commands are shown as declined, and a paused tool loop carries its output into the next turn;
+  - the destructive-command guard now splits command chains and checks every operand, so
+    `rm -rf dist /`, `rm -rf ./*`, `rm --recursive --force /`, `git clean --force`, deletes outside
+    the project and newline-separated scripts are caught, while `git push … && gh pr create -f`,
+    `git restore --staged .` and `npm i sudo-prompt` are no longer flagged.
+
 ## Unreleased — fix "every message opens a new tab", bigger sessions
 
 - **Fixed:** once the session budget ran low, *every* following prompt was a "rotate" (usage was never

@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import {
   CODEBASE_CONTEXT_TOKEN,
+  FOLDER_CONTEXT_PREFIX,
+  GIT_CONTEXT_TOKEN,
+  OPEN_EDITORS_CONTEXT_TOKEN,
+  PROBLEMS_CONTEXT_TOKEN,
   type BridgeStatusInfo,
   type ContextInfo,
   type PromptAttachment,
@@ -388,8 +392,8 @@ function FileChangeCard({ message }: { message: ChatMessage }) {
         <span className={`change-status ${status}`}>{statusLabel(status)}</span>
       </div>
       <ul className="change-list">
-        {files.map((file) => (
-          <li key={file.path}>
+        {files.map((file, index) => (
+          <li key={`${index}-${file.path}`}>
             <span className={`badge ${file.action}`}>{file.action}</span>
             <button
               className="file-diff-link"
@@ -401,6 +405,20 @@ function FileChangeCard({ message }: { message: ChatMessage }) {
           </li>
         ))}
       </ul>
+      {status === "applied" ? (
+        <div className="change-actions">
+          <button className="btn ghost" onClick={() => post({ type: "previewChanges", turnId: message.turnId })}>
+            View diff
+          </button>
+          <button
+            className="btn ghost"
+            title="Restore these files to how they were before this change"
+            onClick={() => post({ type: "undoChanges", turnId: message.turnId })}
+          >
+            Undo
+          </button>
+        </div>
+      ) : null}
       {showActions ? (
         <div className="change-actions">
           <button
@@ -430,8 +448,10 @@ function FileChangeCard({ message }: { message: ChatMessage }) {
   );
 }
 
-function statusLabel(status: "pending" | "applying" | "applied" | "skipped" | "error"): string {
+function statusLabel(status: "pending" | "applying" | "applied" | "skipped" | "error" | "reverted"): string {
   switch (status) {
+    case "reverted":
+      return "undone";
     case "applying":
       return "applying…";
     case "applied":
@@ -461,10 +481,20 @@ const SLASH_COMMANDS: { cmd: string; desc: string }[] = [
   { cmd: "ask", desc: "Ask mode — review a diff before applying" },
   { cmd: "auto", desc: "Auto-edit mode — apply changes automatically" },
   { cmd: "plan", desc: "Plan mode — propose a plan, make no edits" },
+  { cmd: "full", desc: "Full access — edit files & run commands with no approvals" },
+  { cmd: "undo", desc: "Undo the agent's last file changes" },
   { cmd: "compact", desc: "Compact the session now" },
   { cmd: "clear", desc: "Reset the session (new chat)" },
   { cmd: "open", desc: "Open the chat tab in a browser" },
   { cmd: "close", desc: "Close the WebChat browser instance" }
+];
+
+/** Special @-mentions that pull in VS Code state instead of a file. */
+const SPECIAL_MENTIONS: readonly { keyword: string; value: string; name: string; path: string }[] = [
+  { keyword: "codebase", value: CODEBASE_CONTEXT_TOKEN, name: "Entire codebase", path: "index all source files" },
+  { keyword: "problems", value: PROBLEMS_CONTEXT_TOKEN, name: "Problems", path: "errors & warnings from the Problems panel" },
+  { keyword: "git", value: GIT_CONTEXT_TOKEN, name: "Git changes", path: "git status + uncommitted diff" },
+  { keyword: "open", value: OPEN_EDITORS_CONTEXT_TOKEN, name: "Open editors", path: "every file open in the editor" }
 ];
 
 function buildMentionItems(
@@ -474,14 +504,36 @@ function buildMentionItems(
 ): MentionItem[] {
   const q = query.toLowerCase();
   const items: MentionItem[] = [];
-  if ("codebase".startsWith(q) && !attached.includes(CODEBASE_CONTEXT_TOKEN)) {
-    items.push({ value: CODEBASE_CONTEXT_TOKEN, name: "Entire codebase", path: "index all source files" });
+  for (const special of SPECIAL_MENTIONS) {
+    if (special.keyword.startsWith(q) && !attached.includes(special.value)) {
+      items.push({ value: special.value, name: special.name, path: special.path });
+    }
   }
-  for (const file of fileSuggestions?.files ?? []) {
-    if (items.length >= 9) {
+
+  // Folders: parent directories of matching files whose name contains the query.
+  const files = (fileSuggestions?.files ?? []).filter((file) => file.toLowerCase().includes(q));
+  const folders: string[] = [];
+  if (q.length > 0) {
+    for (const file of files) {
+      const parts = file.split("/").slice(0, -1);
+      for (let depth = parts.length; depth > 0; depth -= 1) {
+        const folder = parts.slice(0, depth).join("/");
+        const name = parts[depth - 1].toLowerCase();
+        if (name.includes(q) && !folders.includes(folder) && !attached.includes(FOLDER_CONTEXT_PREFIX + folder)) {
+          folders.push(folder);
+        }
+      }
+    }
+  }
+  for (const folder of folders.slice(0, 3)) {
+    items.push({ value: FOLDER_CONTEXT_PREFIX + folder, name: `${folder.slice(folder.lastIndexOf("/") + 1)}/`, path: `folder · ${folder}/` });
+  }
+
+  for (const file of files) {
+    if (items.length >= 10) {
       break;
     }
-    if (!file.toLowerCase().includes(q) || attached.includes(file)) {
+    if (attached.includes(file)) {
       continue;
     }
     items.push({ value: file, name: file.slice(file.lastIndexOf("/") + 1), path: file });
@@ -490,7 +542,23 @@ function buildMentionItems(
 }
 
 function chipLabel(value: string): string {
-  return value === CODEBASE_CONTEXT_TOKEN ? "codebase" : value.slice(value.lastIndexOf("/") + 1);
+  const special = SPECIAL_MENTIONS.find((item) => item.value === value);
+  if (special) {
+    return special.keyword;
+  }
+  if (value.startsWith(FOLDER_CONTEXT_PREFIX)) {
+    const folder = value.slice(FOLDER_CONTEXT_PREFIX.length);
+    return `${folder.slice(folder.lastIndexOf("/") + 1)}/`;
+  }
+  return value.slice(value.lastIndexOf("/") + 1);
+}
+
+function chipTitle(value: string): string {
+  const special = SPECIAL_MENTIONS.find((item) => item.value === value);
+  if (special) {
+    return `${special.name}: ${special.path}`;
+  }
+  return value.startsWith(FOLDER_CONTEXT_PREFIX) ? `Folder ${value.slice(FOLDER_CONTEXT_PREFIX.length)}/` : value;
 }
 
 interface ComposerAttachment extends PromptAttachment {
@@ -628,6 +696,12 @@ function Composer({
       case "plan":
         post({ type: "updateSetting", key: "agentMode", value: cmd });
         break;
+      case "full":
+        post({ type: "updateSetting", key: "agentMode", value: "bypass" });
+        break;
+      case "undo":
+        post({ type: "undoChanges" });
+        break;
       case "compact":
         post({ type: "sessionAction", action: "compact" });
         break;
@@ -756,7 +830,7 @@ function Composer({
       {attached.length > 0 ? (
         <div className="attached-chips">
           {attached.map((value) => (
-            <span className="attach-chip" key={value} title={value === CODEBASE_CONTEXT_TOKEN ? "Entire codebase" : value}>
+            <span className="attach-chip" key={value} title={chipTitle(value)}>
               @{chipLabel(value)}
               <button
                 className="attach-remove"
@@ -807,7 +881,7 @@ function Composer({
       <textarea
         ref={inputRef}
         className="composer-input"
-        placeholder="Ask LeechCode…   @ files · / commands · paste a screenshot · Enter to send"
+        placeholder="Ask LeechCode…   @ files, folders, problems, git, open · / commands · Enter to send"
         value={text}
         rows={3}
         onChange={onChange}
@@ -833,7 +907,7 @@ function Composer({
           <option value="ask">Ask</option>
           <option value="auto">Auto-edit</option>
           <option value="plan">Plan</option>
-          <option value="bypass">Bypass</option>
+          <option value="bypass">Full access</option>
         </select>
         {provider?.models && provider.models.length > 0 ? (
           <select

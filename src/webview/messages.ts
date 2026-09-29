@@ -3,6 +3,14 @@
 
 /** Sentinel context path meaning "index the entire workspace" (used by @codebase and /index). */
 export const CODEBASE_CONTEXT_TOKEN = "::codebase::";
+/** @problems — the Problems panel (compiler/linter errors and warnings). */
+export const PROBLEMS_CONTEXT_TOKEN = "::problems::";
+/** @git — git status and the uncommitted diff. */
+export const GIT_CONTEXT_TOKEN = "::git::";
+/** @open — every file open in the editor. */
+export const OPEN_EDITORS_CONTEXT_TOKEN = "::open::";
+/** @folder — prefix + workspace-relative folder, e.g. "::folder::src/agent". */
+export const FOLDER_CONTEXT_PREFIX = "::folder::";
 
 export interface ProviderInfo {
   readonly id: string;
@@ -19,7 +27,7 @@ export interface ProviderInfo {
 
 export interface FileChangeInfo {
   readonly path: string;
-  readonly action: "write" | "delete";
+  readonly action: "write" | "delete" | "edit";
 }
 
 export interface SessionUsageInfo {
@@ -46,6 +54,10 @@ export interface WebChatSettings {
   readonly agentMode: "ask" | "auto" | "plan" | "bypass";
   readonly applyMode: "ask" | "auto" | "never";
   readonly autoRepair: boolean;
+  /** Tool rounds per user task (0 = mode default: 6, or 25 in full access). */
+  readonly maxToolIterations: number;
+  /** In full access, still ask before commands that look destructive. */
+  readonly confirmDangerousCommands: boolean;
   /** Effective per-message character limit for the current provider (customizable). */
   readonly messageLimit: number;
   /** Effective total conversation character budget for the current provider (caps a chunked index). */
@@ -135,6 +147,13 @@ export type HostToWebview =
     }
   | { readonly type: "applyResult"; readonly applied: readonly FileChangeInfo[]; readonly error?: string }
   | {
+      readonly type: "undoResult";
+      readonly turnId: string;
+      readonly reverted: readonly string[];
+      /** Changes from that turn that were kept (still undoable). */
+      readonly remaining: number;
+    }
+  | {
       readonly type: "commandOutput";
       readonly command: string;
       readonly output: string;
@@ -168,6 +187,7 @@ export type WebviewToHost =
   | { readonly type: "applyChanges"; readonly turnId?: string; readonly files: readonly FileChangeInfo[] }
   | { readonly type: "previewChanges"; readonly turnId?: string; readonly path?: string }
   | { readonly type: "skipChanges"; readonly turnId?: string }
+  | { readonly type: "undoChanges"; readonly turnId?: string }
   | { readonly type: "runCommands"; readonly turnId?: string }
   | { readonly type: "skipCommands"; readonly turnId?: string }
   | { readonly type: "cancelPrompt"; readonly turnId?: string }

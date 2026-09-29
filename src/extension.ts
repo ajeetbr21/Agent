@@ -19,6 +19,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("webchat.openSettings", () => provider.reveal("settings")),
     vscode.commands.registerCommand("webchat.startBridge", () => controller?.startBridge(false)),
     vscode.commands.registerCommand("webchat.showBridgeStatus", showBridgeStatus),
+    vscode.commands.registerCommand("webchat.undoLastChanges", async () => {
+      await provider.reveal("chat"); // so the result notice is visible
+      await controller?.undoChanges();
+    }),
     vscode.commands.registerCommand("webchat.copyBridgeToken", () => controller?.copyBridgeToken()),
     vscode.commands.registerCommand("webchat.regenerateBridgeToken", async () => {
       const choice = await vscode.window.showWarningMessage(

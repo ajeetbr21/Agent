@@ -32,11 +32,19 @@ import {
   type AgentToolRequest
 } from "../agent/toolProtocol";
 import { describeTool, executeReadonlyTool } from "../agent/tools";
+import { dangerousCommandReason } from "../agent/commandSafety";
 import { buildCompactionPrompt } from "../prompt/compaction";
 import { buildPrompt } from "../prompt/buildPrompt";
 import { buildIndexPrimedNote, planIndexChunks } from "../prompt/indexChunker";
 import { collectActiveEditorContext } from "../workspace/context";
-import { applyAgentFileChanges, type AppliedAgentChange } from "../workspace/applyAgentChanges";
+import {
+  AgentChangeError,
+  applyAgentFileChanges,
+  detectRevertConflicts,
+  resolveWorkspacePath,
+  revertAgentFileChanges,
+  type AppliedAgentChange
+} from "../workspace/applyAgentChanges";
 import { openAppliedDiffs, previewAgentFileChanges } from "../workspace/previewAgentChanges";
 import {
   findProviderByHost,
@@ -60,7 +68,14 @@ import {
   type SessionPolicy,
   type SessionUsage
 } from "../session/policy";
-import { CODEBASE_CONTEXT_TOKEN } from "../webview/messages";
+import {
+  CODEBASE_CONTEXT_TOKEN,
+  FOLDER_CONTEXT_PREFIX,
+  GIT_CONTEXT_TOKEN,
+  OPEN_EDITORS_CONTEXT_TOKEN,
+  PROBLEMS_CONTEXT_TOKEN
+} from "../webview/messages";
+import { collectDiagnostics, gitDiff, gitStatus, openEditorPaths, refreshDiagnostics } from "../agent/vscodeContext";
 import { cleanStreamText, stripMarkedBlock } from "./streamText";
 import { decideIndexTurn } from "./indexTurnGate";
 import type {
@@ -73,7 +88,15 @@ import type {
   WebChatSettings
 } from "../webview/messages";
 
-const MAX_TOOL_ITERATIONS = 6;
+/** Default tool-loop budget per user task; full access mode gets a larger default. */
+const DEFAULT_TOOL_ITERATIONS = 6;
+const DEFAULT_FULL_ACCESS_TOOL_ITERATIONS = 25;
+/** How many applied turns can be undone (>= the full-access loop budget, so a whole task fits). */
+const MAX_UNDO_TURNS = 40;
+/** @folder reads at most this many files (the prompt budget trims further). */
+const MAX_FOLDER_MENTION_FILES = 60;
+/** Mentioned files bigger than this are skipped (binaries, bundles, data dumps). */
+const MAX_MENTION_FILE_BYTES = 400_000;
 const MAX_COMMAND_OUTPUT_CHARS = 8000;
 /** Max subagents that can be spawned within a single user task (bounds runaway delegation). */
 const MAX_SUBAGENTS = 3;
@@ -85,6 +108,9 @@ const MAX_INDEX_CHUNK_RETRIES = 2;
 
 const BRIDGE_TOKEN_SECRET_KEY = "webchat.bridge.pairingToken";
 
+/** WebChatSettings keys stored in user settings only (see updateSetting). */
+const USER_LEVEL_SETTINGS = new Set<string>(["agentMode", "maxToolIterations", "confirmDangerousCommands"]);
+
 const COMPACT_ALONGSIDE_TASK_NOTE =
   "Session upkeep for this turn: do the user task above fully as usual, AND make the `summary` field a thorough compacted development state (objective, current status, decisions, files changed, next actions, known errors) so a fresh chat could continue from it.";
 
@@ -95,6 +121,8 @@ const SETTING_PATHS: Record<string, string> = {
   agentMode: "agent.mode",
   applyMode: "agent.applyMode",
   autoRepair: "agent.autoRepairInvalidResponses",
+  maxToolIterations: "agent.maxToolIterations",
+  confirmDangerousCommands: "agent.confirmDangerousCommands",
   indexChunked: "index.chunked",
   visionEnabled: "vision.enabled",
   visionEndpoint: "vision.endpoint",
@@ -142,6 +170,7 @@ export class WebChatController implements vscode.Disposable {
     }>(),
     applyResult: new vscode.EventEmitter<{ applied: readonly FileChangeInfo[]; error?: string }>(),
     commandOutput: new vscode.EventEmitter<{ command: string; output: string; exitCode: number }>(),
+    undoResult: new vscode.EventEmitter<{ turnId: string; reverted: readonly string[]; remaining: number }>(),
     notice: new vscode.EventEmitter<{ level: "info" | "warn" | "error"; message: string }>()
   };
 
@@ -158,6 +187,7 @@ export class WebChatController implements vscode.Disposable {
   readonly onAssistantParsed = this.emitters.assistantParsed.event;
   readonly onApplyResult = this.emitters.applyResult.event;
   readonly onCommandOutput = this.emitters.commandOutput.event;
+  readonly onUndoResult = this.emitters.undoResult.event;
   readonly onNotice = this.emitters.notice.event;
 
   private readonly output: vscode.OutputChannel;
@@ -175,6 +205,14 @@ export class WebChatController implements vscode.Disposable {
   private lastParsed: { turnId: string; response: AgentResponse } | undefined;
   /** Pre-edit snapshots for the most recently applied turn, powering before→after diffs. */
   private lastApplied: { turnId: string; changes: readonly AppliedAgentChange[] } | undefined;
+  /** Applied turns that can be undone, newest last (bounded). */
+  private readonly undoStack: { turnId: string; changes: readonly AppliedAgentChange[] }[] = [];
+  /** Turns whose files/tools have already been acted on (guards duplicate stream.done events). */
+  private readonly handledTurnIds = new Set<string>();
+  /** Problems to report to the model with the next tool transcript (e.g. edits that didn't apply). */
+  private pendingFeedback: string[] = [];
+  /** One-off facts to tell the model on the next user turn (e.g. "the user undid your edits"). */
+  private pendingNotes: string[] = [];
   /** The last user-initiated turn, so it can be re-sent on manual retry. */
   private lastUserDispatch: { instruction?: string; contextPaths?: readonly string[] } | undefined;
   private lastDispatchProvider: WebChatProvider | undefined;
@@ -203,6 +241,7 @@ export class WebChatController implements vscode.Disposable {
   private indexTurnTimer: NodeJS.Timeout | undefined;
   /** When true, incoming stream deltas/dones are ignored (the in-flight turn was cancelled). */
   private responseSuppressed = false;
+  private warnedUntrustedFullAccess = false;
   /** Set by the panel when a webview is live, so we can prefer inline cards over modal dialogs. */
   webviewConnected = false;
 
@@ -466,8 +505,20 @@ export class WebChatController implements vscode.Disposable {
     // must land in the SAME chat that asked for them — rotating there opened a new tab and sent the
     // tool output to a conversation that never saw the request.
     const sessionAction = forcedAction ?? (resetToolLoop ? undefined : "continue");
+    // One-off notes for the model (e.g. "the user undid your edits") ride along with the next turn.
+    // Kept out of `instruction` so they don't appear in the user's own chat bubble.
+    const notes = instruction?.trim() && this.pendingNotes.length > 0 ? this.pendingNotes.join("\n") : "";
+    if (notes) {
+      this.pendingNotes = [];
+    }
     // Include the project tree on fresh user turns; skip on tool-loop continuations (already in context).
-    const { prompt, action } = await this.buildProviderPrompt(provider, instruction, sessionAction, contextPaths, resetToolLoop);
+    const { prompt, action } = await this.buildProviderPrompt(
+      provider,
+      notes ? `${notes}\n\n${instruction}` : instruction,
+      sessionAction,
+      contextPaths,
+      resetToolLoop
+    );
     // A rotate starts a new conversation, so its budget starts over. (Without this reset every later
     // prompt was also "rotate" — a new browser tab for every single message.)
     this.usage = action === "rotate" ? startFreshSession(prompt) : applyPromptUsage(this.usage, prompt);
@@ -479,7 +530,8 @@ export class WebChatController implements vscode.Disposable {
       });
     }
     this.activeAssistantText = "";
-    this.currentTurnId = randomUUID();
+    const turnId = randomUUID();
+    this.currentTurnId = turnId;
     this.lastDispatchProvider = provider;
     this.repairAttempts = 0;
 
@@ -501,8 +553,8 @@ export class WebChatController implements vscode.Disposable {
     );
 
     const info: DispatchInfo = {
-      turnId: this.currentTurnId,
-      instruction: this.describeInstruction(instruction, action),
+      turnId,
+      instruction: this.describeInstruction(instruction, action), // without `notes` — that's for the model
       action,
       clientCount,
       promptTokens: estimateTokens(prompt)
@@ -659,11 +711,22 @@ export class WebChatController implements vscode.Disposable {
   }
 
   private async handleAssistantDone(fullText: string, providerId?: string): Promise<void> {
+    // A provider page can emit a second chat.stream.done for the same reply (late DOM mutations
+    // after the quiescence timer). Applying a turn twice would duplicate insert-style edits and run
+    // its tools again, so side effects happen once per turn.
+    const doneTurnId = this.currentTurnId;
+    const alreadyHandled = doneTurnId !== undefined && this.handledTurnIds.has(doneTurnId);
+
     this.emitters.streamDone.fire({
       turnId: this.currentTurnId,
       displayText: stripMarkedBlock(fullText),
       responseTokens: estimateTokens(fullText)
     });
+
+    if (alreadyHandled) {
+      this.output.appendLine(`Ignored a repeated completion for turn ${doneTurnId}.`);
+      return;
+    }
 
     let response: AgentResponse | undefined;
     try {
@@ -683,6 +746,10 @@ export class WebChatController implements vscode.Disposable {
     }
 
     const turnId = this.currentTurnId ?? randomUUID();
+    this.handledTurnIds.add(turnId);
+    if (this.handledTurnIds.size > 100) {
+      this.handledTurnIds.delete(this.handledTurnIds.values().next().value as string);
+    }
     this.lastParsed = { turnId, response };
     await this.context.globalState.update("webchat.session.summary", response.summary);
     // Mirror the summary onto the active tracked chat so resuming it later can re-prime the model.
@@ -701,10 +768,15 @@ export class WebChatController implements vscode.Disposable {
     const mode = this.getAgentMode();
     const applyMode = this.getApplyMode();
 
-    // 1) File changes.
+    // 1) File changes. Problems (e.g. an edit whose "find" text isn't in the file) are reported
+    // back to the model together with this turn's tool output, so it can correct itself.
+    this.pendingFeedback = [];
     if (response.files.length > 0) {
       if (applyMode === "auto") {
-        await this.applyChanges(turnId);
+        const result = await this.applyChanges(turnId, { feedbackToModel: false });
+        if (!result.ok) {
+          this.pendingFeedback.push(result.feedback);
+        }
       } else if (applyMode === "ask" && !this.webviewConnected) {
         await this.askToApplyViaModal(response);
       }
@@ -713,7 +785,11 @@ export class WebChatController implements vscode.Disposable {
     // 2) Tools. Read-only tools (read_file/list_dir/search) are always safe to auto-run. Privileged
     // tools (run/spawn_subagent) require approval in ask AND auto modes; only bypass auto-runs them;
     // plan runs neither. The webview shows an approval card; headless falls back to a modal.
-    if (response.tools.length > 0) {
+    if (response.tools.length === 0) {
+      await this.flushPendingFeedback(); // edits failed and nothing else will continue the loop
+      return;
+    }
+    {
       const privileged = response.tools.filter(isPrivilegedTool);
       const readOnly = response.tools.filter((tool) => !isPrivilegedTool(tool));
 
@@ -722,7 +798,25 @@ export class WebChatController implements vscode.Disposable {
           await this.runTools(turnId, readOnly); // reading to plan is allowed; no run/spawn/edits
         }
       } else if (mode === "bypass") {
-        await this.runTools(turnId, response.tools); // full access: run everything, no prompts
+        // Full access: run everything without prompts — except commands that look destructive
+        // (wipe a drive, force-push…) when the dangerous-command guard is on.
+        const dangerous = this.getBool("agent.confirmDangerousCommands", true)
+          ? privileged.filter((tool) => tool.name === "run" && Boolean(dangerousCommandReason(tool.command)))
+          : [];
+        if (dangerous.length === 0 || (await this.confirmDangerousTools(dangerous))) {
+          await this.runTools(turnId, response.tools);
+        } else {
+          for (const tool of dangerous) {
+            this.emitters.commandOutput.fire({
+              command: `$ ${describeTool(tool)}`,
+              output: "Declined by the user (flagged as potentially destructive).",
+              exitCode: 1
+            });
+          }
+          await this.runTools(turnId, response.tools.filter((tool) => !dangerous.includes(tool)), [
+            `The user declined these commands, so they were NOT run: ${dangerous.map(describeTool).join("; ")}. Find a safer way or ask the user.`
+          ]);
+        }
       } else if (privileged.length === 0) {
         await this.runTools(turnId, readOnly); // ask/auto: read-only tools are safe to auto-run
       } else if (!this.webviewConnected) {
@@ -734,10 +828,35 @@ export class WebChatController implements vscode.Disposable {
         );
         if (choice === "Run") {
           await this.runTools(turnId, response.tools);
+        } else {
+          await this.flushPendingFeedback();
         }
       }
       // ask/auto + webview + privileged tools: wait for the approval card (runCommands message).
     }
+  }
+
+  /** Ask before running commands the dangerous-command guard flagged (full-access mode only). */
+  private async confirmDangerousTools(tools: readonly AgentToolRequest[]): Promise<boolean> {
+    const detail = tools
+      .map((tool) => (tool.name === "run" ? `$ ${tool.command}\n   → ${dangerousCommandReason(tool.command)}` : describeTool(tool)))
+      .join("\n");
+    const choice = await vscode.window.showWarningMessage(
+      "Full access mode: the model wants to run a potentially destructive command.",
+      { modal: true, detail: `${detail}\n\n(Turn this check off with webchat.agent.confirmDangerousCommands.)` },
+      "Run anyway"
+    );
+    return choice === "Run anyway";
+  }
+
+  /** Send queued problems (failed edits) to the model when no tool transcript will carry them. */
+  private async flushPendingFeedback(): Promise<void> {
+    if (this.pendingFeedback.length === 0) {
+      return;
+    }
+    const feedback = this.pendingFeedback.join("\n\n");
+    this.pendingFeedback = [];
+    await this.continueWithToolResult(feedback);
   }
 
   /** Approve + run the pending turn's tools (webview "Approve & run" and the headless modal). */
@@ -756,8 +875,27 @@ export class WebChatController implements vscode.Disposable {
    * commands stream their output and feed a combined transcript back to the chat; a spawn_subagent
    * launches a focused isolated continuation instead.
    */
-  private async runTools(turnId: string | undefined, tools: readonly AgentToolRequest[]): Promise<void> {
+  private async runTools(
+    turnId: string | undefined,
+    tools: readonly AgentToolRequest[],
+    notes: readonly string[] = []
+  ): Promise<void> {
+    // If this turn both edited files and asks for diagnostics, let the language servers catch up
+    // first — otherwise the model reads pre-edit problems and thinks its change compiled.
+    const justApplied = this.lastApplied?.turnId === turnId ? this.lastApplied : undefined;
+    if (justApplied && tools.some((tool) => tool.name === "diagnostics")) {
+      await refreshDiagnostics(
+        justApplied.changes.filter((change) => change.action !== "delete").map((change) => change.path)
+      );
+    }
+    // Failed edits / declined commands travel in the same continuation as the tool output, so the
+    // model gets exactly one follow-up message per turn.
+    const preamble = [...this.pendingFeedback, ...notes];
+    this.pendingFeedback = [];
     if (tools.length === 0) {
+      if (preamble.length > 0) {
+        await this.continueWithToolResult(preamble.join("\n\n"));
+      }
       return;
     }
     const subagents = tools.filter(
@@ -765,7 +903,7 @@ export class WebChatController implements vscode.Disposable {
     );
     const infoAndRun = tools.filter((t) => t.name !== "spawn_subagent");
 
-    const transcript: string[] = [];
+    const transcript: string[] = [...preamble];
     for (const tool of infoAndRun) {
       if (tool.name === "run") {
         const result = await this.execCommand(tool.command);
@@ -826,8 +964,12 @@ export class WebChatController implements vscode.Disposable {
     await this.dispatchPrompt(instruction, "continue", sub.context ?? [], false);
   }
 
-  skipCommands(): void {
+  skipCommands(turnId?: string): void {
+    if (turnId && this.lastParsed && this.lastParsed.turnId !== turnId) {
+      return; // Skip pressed on an older card — don't touch the current turn's queue
+    }
     this.emitters.notice.fire({ level: "info", message: "Skipped the requested tools." });
+    void this.flushPendingFeedback();
   }
 
   private execCommand(command: string): Promise<{ output: string; exitCode: number }> {
@@ -848,10 +990,14 @@ export class WebChatController implements vscode.Disposable {
 
   /** Feed command output back to the chat so the model can read results and continue (capped). */
   private async continueWithToolResult(outputs: string): Promise<void> {
-    if (this.toolIterations >= MAX_TOOL_ITERATIONS) {
+    const maxIterations = this.getMaxToolIterations();
+    if (this.toolIterations >= maxIterations) {
+      // Don't lose this round's output: carry it into the next user turn so "continue" resumes with
+      // the tool results (and any failed-edit feedback) the model never saw.
+      this.pendingNotes.push(`Output of the tools from the previous round (the automatic loop paused here):\n${outputs}`);
       this.emitters.notice.fire({
         level: "warn",
-        message: `Reached the command-loop limit (${MAX_TOOL_ITERATIONS}); stopping auto-continue.`
+        message: `Reached the tool-loop limit (${maxIterations} rounds) for this task; stopping auto-continue. Send "continue" to keep going (the last tool output is carried over), or raise webchat.agent.maxToolIterations.`
       });
       return;
     }
@@ -865,40 +1011,136 @@ export class WebChatController implements vscode.Disposable {
     await this.dispatchPrompt(instruction, undefined, undefined, false);
   }
 
-  async applyChanges(turnId?: string): Promise<void> {
+  /**
+   * Apply a turn's file changes. On failure nothing is written; the problems are either returned to
+   * the caller (which batches them with tool output) or, when applied from the UI, sent to the
+   * model directly so it can resend corrected edits.
+   */
+  async applyChanges(
+    turnId?: string,
+    options: { feedbackToModel?: boolean } = {}
+  ): Promise<{ ok: true } | { ok: false; feedback: string }> {
     const files = this.resolveChanges(turnId);
     if (!files) {
       this.emitters.notice.fire({ level: "warn", message: "No pending file changes to apply." });
-      return;
+      return { ok: true };
     }
 
     try {
       const applied = await applyAgentFileChanges(files, this.context);
-      this.lastApplied = { turnId: turnId ?? this.lastParsed?.turnId ?? "", changes: applied };
+      const appliedTurn = turnId ?? this.lastParsed?.turnId ?? "";
+      this.lastApplied = { turnId: appliedTurn, changes: applied };
+      this.undoStack.push({ turnId: appliedTurn, changes: applied });
+      if (this.undoStack.length > MAX_UNDO_TURNS) {
+        this.undoStack.shift();
+      }
       this.emitters.applyResult.fire({
         applied: applied.map((change) => ({ path: change.path, action: change.action }))
       });
       this.emitters.notice.fire({
         level: "info",
-        message: `Applied ${applied.length} file change${applied.length === 1 ? "" : "s"}.`
+        message: `Applied ${applied.length} file change${applied.length === 1 ? "" : "s"}. Undo: /undo or the card's Undo button.`
       });
-      // Show what changed (before→after) unless the user turned it off.
-      if (this.getBool("diff.showOnApply", true)) {
+      // Show what changed (before→after) unless the user turned it off. Full access mode doesn't
+      // open diff tabs on its own (it would flood the editor during a long autonomous loop) —
+      // the chat card's "View diff" opens them on demand.
+      if (this.getBool("diff.showOnApply", true) && this.getAgentMode() !== "bypass") {
         await openAppliedDiffs(applied, this.context);
       }
+      return { ok: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.output.appendLine(`Could not apply WebChat file changes: ${message}`);
       this.emitters.applyResult.fire({ applied: [], error: message });
       this.emitters.notice.fire({ level: "error", message: `Could not apply file changes: ${message}` });
+      const feedback = [
+        "Your file changes were NOT applied (nothing from that response was written):",
+        error instanceof AgentChangeError ? error.problems.map((problem) => `- ${problem}`).join("\n") : `- ${message}`,
+        "Re-read the affected files with read_file and send corrected changes."
+      ].join("\n");
+      if (options.feedbackToModel !== false && this.getAgentMode() !== "plan") {
+        await this.continueWithToolResult(feedback);
+      }
+      return { ok: false, feedback };
+    }
+  }
+
+  /**
+   * Undo the file changes of a turn (default: the most recent one) from the pre-edit snapshots.
+   * Files the user changed after the agent wrote them are only overwritten after confirmation.
+   */
+  async undoChanges(turnId?: string): Promise<void> {
+    const index = turnId
+      ? this.undoStack.findIndex((entry) => entry.turnId === turnId)
+      : this.undoStack.length - 1;
+    const entry = index >= 0 ? this.undoStack[index] : undefined;
+    if (!entry) {
+      this.emitters.notice.fire({ level: "info", message: "Nothing to undo." });
+      return;
+    }
+
+    let changes = entry.changes;
+    const conflicts = await detectRevertConflicts(changes);
+    if (conflicts.length > 0) {
+      const choice = await vscode.window.showWarningMessage(
+        `${conflicts.length} file${conflicts.length === 1 ? " was" : "s were"} changed after LeechCode edited ${conflicts.length === 1 ? "it" : "them"}.`,
+        { modal: true, detail: `${conflicts.join("\n")}\n\nUndo would overwrite those later edits.` },
+        "Undo all (overwrite)",
+        "Undo the others only"
+      );
+      if (!choice) {
+        return;
+      }
+      if (choice === "Undo the others only") {
+        changes = changes.filter((change) => !conflicts.includes(change.path));
+      }
+    }
+
+    try {
+      const reverted = await revertAgentFileChanges(changes);
+      // Keep anything that was NOT reverted (e.g. "undo the others only") so it stays undoable.
+      const revertedKeys = new Set(changes.map((change) => change.key));
+      const remaining = entry.changes.filter((change) => !revertedKeys.has(change.key));
+      const position = this.undoStack.indexOf(entry); // re-find: the stack may have moved while the dialog was open
+      if (position >= 0) {
+        if (remaining.length > 0) {
+          this.undoStack[position] = { turnId: entry.turnId, changes: remaining };
+        } else {
+          this.undoStack.splice(position, 1);
+        }
+      }
+      if (this.lastApplied?.turnId === entry.turnId) {
+        this.lastApplied = remaining.length > 0 ? { turnId: entry.turnId, changes: remaining } : undefined;
+      }
+      if (reverted.length > 0) {
+        this.emitters.undoResult.fire({ turnId: entry.turnId, reverted, remaining: remaining.length });
+      }
+      this.emitters.notice.fire({
+        level: "info",
+        message: reverted.length > 0
+          ? `Undid ${reverted.length} file change${reverted.length === 1 ? "" : "s"}: ${reverted.join(", ")}`
+          : "Nothing was undone."
+      });
+      if (reverted.length > 0) {
+        this.pendingNotes.push(
+          `Note: the user UNDID your earlier changes to ${reverted.join(", ")} — those files are back to their previous content. read_file them again before editing.`
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitters.notice.fire({ level: "error", message: `Undo failed: ${message}` });
     }
   }
 
   async previewChanges(turnId?: string, path?: string): Promise<void> {
     // If this turn was already applied, show the real before→after diff from the snapshots (the
     // working file already holds the new content, so a plain disk diff would be empty).
-    if (this.lastApplied && (!turnId || this.lastApplied.turnId === turnId)) {
-      const opened = await openAppliedDiffs(this.lastApplied.changes, this.context, path);
+    const appliedTurn = turnId
+      ? this.undoStack.find((entry) => entry.turnId === turnId) ??
+        (this.lastApplied?.turnId === turnId ? this.lastApplied : undefined)
+      : this.lastApplied ?? this.undoStack[this.undoStack.length - 1];
+    if (appliedTurn) {
+      const opened = await openAppliedDiffs(appliedTurn.changes, this.context, path);
       if (opened > 0) {
         this.emitters.notice.fire({ level: "info", message: `Opened ${opened} diff${opened === 1 ? "" : "s"}.` });
         return;
@@ -938,6 +1180,9 @@ export class WebChatController implements vscode.Disposable {
     this.activeAssistantText = "";
     this.lastParsed = undefined;
     this.lastApplied = undefined;
+    this.pendingFeedback = [];
+    this.pendingNotes = [];
+    this.handledTurnIds.clear();
     this.bridgeSessionId = randomUUID();
     await this.context.globalState.update("webchat.bridge.sessionId", this.bridgeSessionId);
     await this.context.globalState.update("webchat.session.summary", "");
@@ -1479,6 +1724,8 @@ export class WebChatController implements vscode.Disposable {
       agentMode: this.getAgentMode(),
       applyMode: this.getApplyMode(),
       autoRepair: config.get("agent.autoRepairInvalidResponses", true),
+      maxToolIterations: config.get("agent.maxToolIterations", 0),
+      confirmDangerousCommands: config.get("agent.confirmDangerousCommands", true),
       messageLimit: this.getProviderMessageLimit(config.get("defaultProvider", "chatgpt")),
       sessionLimit: this.getProviderSessionLimit(config.get("defaultProvider", "chatgpt")),
       indexChunked: config.get("index.chunked", true),
@@ -1516,9 +1763,12 @@ export class WebChatController implements vscode.Disposable {
     if (!path) {
       return;
     }
-    await vscode.workspace
-      .getConfiguration("webchat")
-      .update(path, value, vscode.ConfigurationTarget.Workspace);
+    // Settings that grant the agent autonomy are user-level only (application scope): a cloned
+    // repo's .vscode/settings.json must never be able to switch LeechCode into full access.
+    const target = USER_LEVEL_SETTINGS.has(key)
+      ? vscode.ConfigurationTarget.Global
+      : vscode.ConfigurationTarget.Workspace;
+    await vscode.workspace.getConfiguration("webchat").update(path, value, target);
     if (key === "bridgePort") {
       this.emitters.notice.fire({
         level: "warn",
@@ -1865,23 +2115,101 @@ export class WebChatController implements vscode.Disposable {
     return { path: "PROJECT_STRUCTURE.txt", content };
   }
 
-  /** Read @-attached workspace files for inclusion in the prompt context. */
+  /**
+   * Read @-mentions for the prompt: plain workspace files, plus the special mentions —
+   * @problems (Problems panel), @git (status + diff), @open (all open editors) and @folder.
+   */
   private async collectContextFiles(paths: readonly string[]): Promise<PromptFile[]> {
     const root = vscode.workspace.workspaceFolders?.[0];
     if (!root || paths.length === 0) {
       return [];
     }
     const files: PromptFile[] = [];
-    for (const rel of paths) {
+    const seen = new Set<string>();
+    const addFile = async (rel: string) => {
+      if (seen.has(rel)) {
+        return;
+      }
+      seen.add(rel);
+      const content = await this.readWorkspaceText(root, rel);
+      if (content !== undefined) {
+        files.push({ path: rel, content });
+      }
+    };
+
+    for (const entry of paths) {
       try {
-        const uri = vscode.Uri.joinPath(root.uri, ...rel.split("/").filter(Boolean));
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        files.push({ path: rel, content: Buffer.from(bytes).toString("utf8") });
-      } catch {
-        // skip unreadable / missing files
+        if (entry === PROBLEMS_CONTEXT_TOKEN) {
+          files.push({ path: "PROBLEMS.txt", content: collectDiagnostics() });
+        } else if (entry === GIT_CONTEXT_TOKEN) {
+          files.push({ path: "GIT_CHANGES.txt", content: await this.describeGitChanges() });
+        } else if (entry === OPEN_EDITORS_CONTEXT_TOKEN) {
+          for (const rel of openEditorPaths()) {
+            await addFile(rel);
+          }
+        } else if (entry.startsWith(FOLDER_CONTEXT_PREFIX)) {
+          const folder = entry.slice(FOLDER_CONTEXT_PREFIX.length).replace(/\/+$/, "");
+          const listed = await this.listFolderFiles(root, folder);
+          files.push({
+            path: `${folder}/FOLDER_CONTENTS.txt`,
+            content: listed.length > 0
+              ? `Files in ${folder}/ (${listed.length}${listed.length >= MAX_FOLDER_MENTION_FILES ? "+, capped" : ""}):\n${listed.join("\n")}`
+              : `No readable files in ${folder}/.`
+          });
+          for (const rel of listed) {
+            await addFile(rel);
+          }
+        } else if (entry !== CODEBASE_CONTEXT_TOKEN) {
+          await addFile(entry);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        files.push({ path: `${entry.replace(/[:/\\]+/g, "_")}.error.txt`, content: `Could not collect ${entry}: ${message}` });
       }
     }
     return files;
+  }
+
+  /** git status + uncommitted (unstaged and staged) diff, for the @git mention. */
+  private async describeGitChanges(): Promise<string> {
+    const parts = [await gitStatus(), await gitDiff(undefined, false)];
+    const staged = await gitDiff(undefined, true);
+    if (!staged.startsWith("No ")) {
+      parts.push(staged);
+    }
+    return parts.join("\n\n");
+  }
+
+  /** Text files under a workspace folder, for the @folder mention (capped, no deps/build output). */
+  private async listFolderFiles(root: vscode.WorkspaceFolder, folder: string): Promise<string[]> {
+    if (folder) {
+      resolveWorkspacePath(root, folder); // rejects absolute / ../ paths
+    }
+    const exclude = "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/build/**,**/.next/**,**/*.map,**/*.lock,**/*.min.js}";
+    // Base the pattern on the folder URI: a folder name containing glob characters (Next.js "app/[id]")
+    // must be taken literally, not as a character class.
+    const pattern = folder
+      ? new vscode.RelativePattern(vscode.Uri.joinPath(root.uri, ...folder.split("/").filter(Boolean)), "**/*")
+      : new vscode.RelativePattern(root, "**/*");
+    const uris = await vscode.workspace.findFiles(pattern, exclude, MAX_FOLDER_MENTION_FILES);
+    return uris
+      .map((uri) => vscode.workspace.asRelativePath(uri, false))
+      .sort((a, b) => a.localeCompare(b));
+  }
+
+  /** A workspace file's text, or undefined if it is missing, binary or too large. */
+  private async readWorkspaceText(root: vscode.WorkspaceFolder, rel: string): Promise<string | undefined> {
+    try {
+      const uri = resolveWorkspacePath(root, rel);
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      if (bytes.byteLength > MAX_MENTION_FILE_BYTES) {
+        return undefined;
+      }
+      const text = Buffer.from(bytes).toString("utf8");
+      return /[\x00-\x08]/.test(text) ? undefined : text;
+    } catch {
+      return undefined; // unreadable / missing / unsafe path
+    }
   }
 
   getContextInfo(): ContextInfo {
@@ -2066,7 +2394,10 @@ export class WebChatController implements vscode.Disposable {
       "Skip"
     );
     if (choice === "Apply Changes") {
-      await this.applyChanges(this.lastParsed?.turnId);
+      const result = await this.applyChanges(this.lastParsed?.turnId, { feedbackToModel: false });
+      if (!result.ok) {
+        this.pendingFeedback.push(result.feedback);
+      }
     } else if (choice === "Preview Diffs") {
       await this.previewChanges(this.lastParsed?.turnId);
     }
@@ -2099,10 +2430,31 @@ export class WebChatController implements vscode.Disposable {
     };
   }
 
+  /** Tool rounds allowed per user task (webchat.agent.maxToolIterations; 0 = mode default). */
+  private getMaxToolIterations(): number {
+    const configured = Math.trunc(this.getNumber("agent.maxToolIterations", 0));
+    if (configured > 0) {
+      return Math.min(configured, 200);
+    }
+    return this.getAgentMode() === "bypass" ? DEFAULT_FULL_ACCESS_TOOL_ITERATIONS : DEFAULT_TOOL_ITERATIONS;
+  }
+
   private getAgentMode(): "ask" | "auto" | "plan" | "bypass" {
     const mode = this.getString("agent.mode", "ask");
+    if (mode === "bypass" && vscode.workspace.isTrusted === false) {
+      // Restricted Mode (an untrusted folder): never auto-run the model's commands there.
+      if (!this.warnedUntrustedFullAccess) {
+        this.warnedUntrustedFullAccess = true;
+        this.emitters.notice.fire({
+          level: "warn",
+          message: "This folder isn't trusted (Restricted Mode), so full access acts like Auto-edit: commands still need your approval. Trust the folder to allow full access."
+        });
+      }
+      return "auto";
+    }
     return mode === "auto" || mode === "plan" || mode === "bypass" ? mode : "ask";
   }
+
 
   /**
    * Effective file-apply behavior, derived ONLY from the agent mode — the legacy `agent.applyMode`

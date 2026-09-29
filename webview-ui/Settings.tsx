@@ -151,6 +151,33 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
           checked={settings.autoRepair}
           onChange={(value) => update("autoRepair", value)}
         />
+        <SelectField
+          label="Agent mode"
+          hint="Full access applies edits and runs commands with no approvals — every change can still be undone (/undo). Saved in your user settings, never per repository."
+          value={settings.agentMode}
+          options={[
+            { value: "ask", label: "Ask — review edits and commands" },
+            { value: "auto", label: "Auto-edit — apply edits, approve commands" },
+            { value: "plan", label: "Plan — no edits, no commands" },
+            { value: "bypass", label: "Full access — no approvals" }
+          ]}
+          onChange={(value) => update("agentMode", value)}
+        />
+        <NumberField
+          label="Max tool rounds per task"
+          hint="How many read → edit → run cycles the agent may do before pausing. 0 = default (6, or 25 in full access)."
+          value={settings.maxToolIterations}
+          min={0}
+          max={200}
+          step={1}
+          onChange={(value) => update("maxToolIterations", value)}
+        />
+        <ToggleField
+          label="Confirm dangerous commands in full access"
+          hint="Still ask before commands that could wipe data: deleting a drive/home folder, formatting disks, force-push, git reset --hard, curl | sh, sudo, shutdown."
+          checked={settings.confirmDangerousCommands}
+          onChange={(value) => update("confirmDangerousCommands", value)}
+        />
       </Section>
 
       <Section
