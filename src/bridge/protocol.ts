@@ -142,7 +142,11 @@ export interface ChatStatePayload {
     | "ready"
     | "login-required"
     | "prompt-inserted"
+    /** Still working on inserting/sending — the provider has NOT received the prompt yet. */
     | "submitting"
+    /** The send control was actually activated: the provider may now be generating. */
+    | "submitted"
+    | "cancelled"
     | "streaming"
     | "waiting-response"
     | "complete"

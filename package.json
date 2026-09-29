@@ -84,6 +84,11 @@
         "category": "LeechCode"
       },
       {
+        "command": "webchat.showRequestStatus",
+        "title": "Show Request Status",
+        "category": "LeechCode"
+      },
+      {
         "command": "webchat.undoLastChanges",
         "title": "Undo Last Agent Changes",
         "category": "LeechCode"
@@ -253,6 +258,32 @@
           "minimum": 1,
           "maximum": 500,
           "description": "Safety cap on the number of messages used to deliver a chunked codebase index. Files beyond this many messages are skipped."
+        },
+        "webchat.request.timeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 15,
+          "maximum": 1800,
+          "description": "How long to wait without any feedback from the chat page before treating a request as failed (a closed tab or a stuck page would otherwise stall the task forever)."
+        },
+        "webchat.failover.mode": {
+          "type": "string",
+          "default": "off",
+          "enum": ["off", "safe", "always"],
+          "enumDescriptions": [
+            "Off: a failed request is only reported; you retry or switch provider yourself.",
+            "Safe: hand the task to another provider automatically, but only when the failure happened before the provider saw the prompt (nothing can be duplicated).",
+            "Always: also offer to continue after an ambiguous failure (the provider may already have edited files or run commands) — LeechCode asks first."
+          ],
+          "scope": "application",
+          "markdownDescription": "What to do when a request fails in the browser. A handover message is built locally (objective, files already changed, tool output, errors) because a provider's own chat history cannot be transferred."
+        },
+        "webchat.failover.providers": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string" },
+          "scope": "application",
+          "markdownDescription": "Ordered provider ids to try when failing over, e.g. `[\"chatgpt\", \"claude\", \"gemini\"]`. Empty = the current provider first, then the rest."
         },
         "webchat.customProviders": {
           "type": "array",

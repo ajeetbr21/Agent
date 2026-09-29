@@ -78,6 +78,20 @@ import {
 import { collectDiagnostics, gitDiff, gitStatus, openEditorPaths, refreshDiagnostics } from "../agent/vscodeContext";
 import { cleanStreamText, stripMarkedBlock } from "./streamText";
 import { decideIndexTurn } from "./indexTurnGate";
+import {
+  chooseFailoverProvider,
+  createRequestState,
+  describePhase,
+  isFailure,
+  isTerminal,
+  isSafeToRetryElsewhere,
+  recordProviderResult,
+  reduceRequest,
+  type ProviderHealth,
+  type RequestEvent,
+  type RequestState
+} from "./taskState";
+import { buildContinuationPrompt, describeContinuation, type ContinuationPackage } from "./continuation";
 import type {
   BridgeStatusInfo,
   ContextInfo,
@@ -91,6 +105,11 @@ import type {
 /** Default tool-loop budget per user task; full access mode gets a larger default. */
 const DEFAULT_TOOL_ITERATIONS = 6;
 const DEFAULT_FULL_ACCESS_TOOL_ITERATIONS = 25;
+/** Tool results carried into a continuation package when switching provider. */
+const MAX_CARRIED_TOOL_RESULTS = 8;
+/** Providers tried for one task before giving up. */
+const MAX_FAILOVERS_PER_TASK = 2;
+
 /** How many applied turns can be undone (>= the full-access loop budget, so a whole task fits). */
 const MAX_UNDO_TURNS = 40;
 /** @folder reads at most this many files (the prompt budget trims further). */
@@ -109,7 +128,7 @@ const MAX_INDEX_CHUNK_RETRIES = 2;
 const BRIDGE_TOKEN_SECRET_KEY = "webchat.bridge.pairingToken";
 
 /** WebChatSettings keys stored in user settings only (see updateSetting). */
-const USER_LEVEL_SETTINGS = new Set<string>(["agentMode", "maxToolIterations", "confirmDangerousCommands"]);
+const USER_LEVEL_SETTINGS = new Set<string>(["agentMode", "maxToolIterations", "confirmDangerousCommands", "failoverMode"]);
 
 const COMPACT_ALONGSIDE_TASK_NOTE =
   "Session upkeep for this turn: do the user task above fully as usual, AND make the `summary` field a thorough compacted development state (objective, current status, decisions, files changed, next actions, known errors) so a fresh chat could continue from it.";
@@ -122,6 +141,7 @@ const SETTING_PATHS: Record<string, string> = {
   applyMode: "agent.applyMode",
   autoRepair: "agent.autoRepairInvalidResponses",
   maxToolIterations: "agent.maxToolIterations",
+  failoverMode: "failover.mode",
   confirmDangerousCommands: "agent.confirmDangerousCommands",
   indexChunked: "index.chunked",
   visionEnabled: "vision.enabled",
@@ -209,6 +229,23 @@ export class WebChatController implements vscode.Disposable {
   private readonly undoStack: { turnId: string; changes: readonly AppliedAgentChange[] }[] = [];
   /** Turns whose files/tools have already been acted on (guards duplicate stream.done events). */
   private readonly handledTurnIds = new Set<string>();
+  /** Lifecycle of the in-flight request, so a failure can be classified safe-to-retry or ambiguous. */
+  private activeRequest: RequestState | undefined;
+  /** Per-provider failure counters and cooldowns, used when choosing a failover target. */
+  private readonly providerHealth = new Map<string, ProviderHealth>();
+  /** Tool results and errors gathered for this task, carried over if we switch provider. */
+  private taskProgress: {
+    objective: string;
+    readonly toolResults: { label: string; output: string }[];
+    readonly errors: string[];
+    readonly changedFiles: { path: string; action: string }[];
+    readonly relevantFiles: string[];
+  } = { objective: "", toolResults: [], errors: [], changedFiles: [], relevantFiles: [] };
+  /** Fires when a request stops producing any page feedback, so a silent tab can't stall the task. */
+  private requestWatchdog: NodeJS.Timeout | undefined;
+  /** Guard so one failed request triggers at most one failover. */
+  private failoverInFlight = false;
+  private failoverCount = 0;
   /** Problems to report to the model with the next tool transcript (e.g. edits that didn't apply). */
   private pendingFeedback: string[] = [];
   /** One-off facts to tell the model on the next user turn (e.g. "the user undid your edits"). */
@@ -277,6 +314,7 @@ export class WebChatController implements vscode.Disposable {
     if (this.statusPollTimer) {
       clearInterval(this.statusPollTimer);
     }
+    this.clearRequestWatchdog();
     this.indexAborted = true;
     this.finishIndexTurn();
     this.bridgeMessageDisposable?.();
@@ -552,6 +590,27 @@ export class WebChatController implements vscode.Disposable {
       })
     );
 
+    // Track this request's lifecycle: only a failure that happened before the page submitted may be
+    // retried on another provider.
+    this.activeRequest = reduceRequest(createRequestState(turnId, provider.id), {
+      kind: "dispatched",
+      providerId: provider.id,
+      delivered: clientCount > 0
+    });
+    this.armRequestWatchdog();
+    if (resetToolLoop && instruction?.trim()) {
+      // A fresh user turn starts a new task: reset what we carry over on a provider switch.
+      this.taskProgress = { objective: instruction.trim(), toolResults: [], errors: [], changedFiles: [], relevantFiles: [] };
+      this.failoverCount = 0;
+    }
+    if (contextPaths && contextPaths.length > 0) {
+      for (const path of contextPaths) {
+        if (!path.startsWith("::") && !this.taskProgress.relevantFiles.includes(path)) {
+          this.taskProgress.relevantFiles.push(path);
+        }
+      }
+    }
+
     const info: DispatchInfo = {
       turnId,
       instruction: this.describeInstruction(instruction, action), // without `notes` — that's for the model
@@ -592,6 +651,7 @@ export class WebChatController implements vscode.Disposable {
     }
 
     this.responseSuppressed = true;
+    this.noteRequestEvent({ kind: "cancelled" });
     // Also abort any in-flight chunked-index delivery.
     this.indexAborted = true;
     this.finishIndexTurn();
@@ -658,6 +718,8 @@ export class WebChatController implements vscode.Disposable {
       this.recordSessionFromPayload(message.payload);
     }
 
+    this.trackRequest(message);
+
     // A cancelled turn (and the follow-up "disregard" exchange) — ignore all streaming until the
     // next real dispatch clears the flag, so nothing from the abandoned prompt reaches the UI/parser.
     if (this.responseSuppressed) {
@@ -702,6 +764,10 @@ export class WebChatController implements vscode.Disposable {
       return;
     }
 
+    if (message.type === "chat.error") {
+      return; // already folded into the request state by trackRequest
+    }
+
     if (message.type === "chat.stream.done" && isDone(message.payload)) {
       this.activeAssistantText = message.payload.fullText || this.activeAssistantText;
       this.usage = applyResponseUsage(this.usage, this.activeAssistantText);
@@ -734,6 +800,7 @@ export class WebChatController implements vscode.Disposable {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.output.appendLine(`Could not parse WebChat agent response: ${message}`);
+      this.noteRequestEvent({ kind: "parse-failed", detail: message });
       const repaired = await this.requestRepair(fullText, message, providerId);
       if (!repaired) {
         this.emitters.notice.fire({ level: "warn", message: `Agent response was not valid: ${message}` });
@@ -746,6 +813,7 @@ export class WebChatController implements vscode.Disposable {
     }
 
     const turnId = this.currentTurnId ?? randomUUID();
+    this.noteRequestEvent({ kind: "parsed" });
     this.handledTurnIds.add(turnId);
     if (this.handledTurnIds.size > 100) {
       this.handledTurnIds.delete(this.handledTurnIds.values().next().value as string);
@@ -836,6 +904,213 @@ export class WebChatController implements vscode.Disposable {
     }
   }
 
+  // ---- request lifecycle + provider failover ---------------------------------------------------
+  /** Fold a bridge message into the in-flight request's lifecycle. */
+  private trackRequest(message: BridgeEnvelope): void {
+    if (!this.activeRequest || this.indexingActive) {
+      return;
+    }
+    const event = requestEventFor(message);
+    if (event) {
+      this.noteRequestEvent(event);
+    }
+  }
+
+  private noteRequestEvent(event: RequestEvent): void {
+    const previous = this.activeRequest;
+    if (!previous) {
+      return;
+    }
+    const next = reduceRequest(previous, event);
+    if (next === previous) {
+      this.armRequestWatchdog(); // still alive — extend the silence timer
+      return;
+    }
+    this.activeRequest = next;
+    if (isTerminal(next.phase)) {
+      this.clearRequestWatchdog();
+    } else {
+      this.armRequestWatchdog();
+    }
+
+    if (next.phase !== previous.phase) {
+      this.output.appendLine(`[request ${next.turnId.slice(0, 8)} on ${next.providerId}] ${describePhase(next.phase)}${next.detail ? ` — ${next.detail}` : ""}`);
+    }
+    if (next.phase === "completed") {
+      this.providerHealth.set(next.providerId, recordProviderResult(this.providerHealth.get(next.providerId), next.providerId, "ok"));
+      return;
+    }
+    if (isFailure(next.phase)) {
+      this.providerHealth.set(
+        next.providerId,
+        recordProviderResult(this.providerHealth.get(next.providerId), next.providerId, "failed", next.detail)
+      );
+      this.taskProgress.errors.push(`${next.providerId}: ${describePhase(next.phase)}${next.detail ? ` — ${next.detail}` : ""}`);
+      void this.handleRequestFailure(next);
+    }
+  }
+
+  /**
+   * A provider page can simply go quiet — a closed tab, a stuck UI, a network stall — and then no
+   * state ever arrives. Without a timer the task would wait forever, so silence for long enough is
+   * itself treated as a failure (ambiguous if the prompt was already submitted).
+   */
+  private armRequestWatchdog(): void {
+    this.clearRequestWatchdog();
+    const seconds = Math.max(15, this.getNumber("request.timeoutSeconds", 120));
+    this.requestWatchdog = setTimeout(() => {
+      this.requestWatchdog = undefined;
+      this.noteRequestEvent({
+        kind: "timeout",
+        detail: `no response from the chat page for ${seconds}s`
+      });
+    }, seconds * 1000);
+  }
+
+  private clearRequestWatchdog(): void {
+    if (this.requestWatchdog) {
+      clearTimeout(this.requestWatchdog);
+      this.requestWatchdog = undefined;
+    }
+  }
+
+  private rememberToolResult(label: string, output: string): void {
+    this.taskProgress.toolResults.push({ label, output });
+    if (this.taskProgress.toolResults.length > MAX_CARRIED_TOOL_RESULTS) {
+      this.taskProgress.toolResults.shift();
+    }
+  }
+
+  /**
+   * A request failed. If it never reached the provider, optionally continue the task on another
+   * provider with a locally built handover. If the provider may already have acted, never replay
+   * automatically — duplicated edits/commands are worse than a stalled task — so ask instead.
+   */
+  private async handleRequestFailure(request: RequestState): Promise<void> {
+    if (this.failoverInFlight || this.responseSuppressed) {
+      return;
+    }
+    const mode = this.getString("failover.mode", "off");
+    if (mode === "off") {
+      this.emitters.notice.fire({
+        level: "warn",
+        message: `${this.providerLabel(request.providerId)} ${describePhase(request.phase)}. Use Retry, or switch provider (enable webchat.failover.mode to hand over automatically).`
+      });
+      return;
+    }
+    if (this.failoverCount >= MAX_FAILOVERS_PER_TASK) {
+      this.emitters.notice.fire({
+        level: "error",
+        message: `Tried ${this.failoverCount} provider${this.failoverCount === 1 ? "" : "s"} for this task without success; stopping. Check the browser tab.`
+      });
+      return;
+    }
+
+    const target = chooseFailoverProvider(this.failoverCandidates(), request.providerId, this.providerHealth);
+    if (!target) {
+      this.emitters.notice.fire({
+        level: "warn",
+        message: "No other provider is configured for failover — add one in Settings (webchat.failover.providers)."
+      });
+      return;
+    }
+
+    const safe = isSafeToRetryElsewhere(request.phase);
+    if (!safe) {
+      if (mode !== "always") {
+        this.emitters.notice.fire({
+          level: "warn",
+          message: `${this.providerLabel(request.providerId)} ${describePhase(request.phase)}, so it was NOT resent automatically (that could duplicate edits or commands). Check the tab, then use Retry or switch to ${this.providerLabel(target)}.`
+        });
+        return;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        `${this.providerLabel(request.providerId)} failed after submitting your request.`,
+        {
+          modal: true,
+          detail: `It may already have started editing files or running commands. Continuing on ${this.providerLabel(target)} could duplicate that work.\n\nThe handover tells the new provider to check the workspace first.`
+        },
+        `Continue on ${this.providerLabel(target)}`
+      );
+      if (choice === undefined) {
+        return;
+      }
+    }
+
+    await this.failoverTo(target, request);
+  }
+
+  /** Hand the task to another provider with a locally built continuation package. */
+  private async failoverTo(providerId: string, failed: RequestState): Promise<void> {
+    this.failoverInFlight = true;
+    try {
+      const pack = this.buildContinuationPackage(failed);
+      this.emitters.notice.fire({
+        level: "info",
+        message: `Continuing on ${this.providerLabel(providerId)} — ${describeContinuation(pack)}.`
+      });
+      await this.setProvider(providerId);
+      this.failoverCount += 1;
+      // "rotate" opens a fresh conversation on the new provider (it has no history to reuse).
+      await this.dispatchPrompt(buildContinuationPrompt(pack), "rotate", undefined, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitters.notice.fire({ level: "error", message: `Could not hand over to ${this.providerLabel(providerId)}: ${message}` });
+    } finally {
+      this.failoverInFlight = false;
+    }
+  }
+
+  /** Everything a fresh provider needs to carry on — the provider's own history cannot be moved. */
+  private buildContinuationPackage(failed: RequestState): ContinuationPackage {
+    return {
+      objective: this.taskProgress.objective || this.lastUserDispatch?.instruction || "",
+      phase: describePhase(failed.phase),
+      workspaceName: vscode.workspace.workspaceFolders?.[0]?.name,
+      changedFiles: [...this.taskProgress.changedFiles],
+      relevantFiles: [...this.taskProgress.relevantFiles],
+      toolResults: [...this.taskProgress.toolResults],
+      errors: [...this.taskProgress.errors],
+      summary: this.getStoredSummary() || undefined,
+      permissions: describePermissions(this.getAgentMode()),
+      checkpoint: this.undoStack.length > 0
+        ? `${this.undoStack.length} undo step${this.undoStack.length === 1 ? "" : "s"}`
+        : undefined,
+      previousRequest: {
+        providerId: this.providerLabel(failed.providerId),
+        phase: describePhase(failed.phase),
+        mayHaveActed: !isSafeToRetryElsewhere(failed.phase)
+      }
+    };
+  }
+
+  /** Ordered failover candidates: the configured list, or every provider with the current one first. */
+  private failoverCandidates(): string[] {
+    const configured = vscode.workspace.getConfiguration("webchat").get<string[]>("failover.providers", []) ?? [];
+    const known = new Set(listProviders().map((provider) => provider.id));
+    const cleaned = configured.filter((id) => known.has(id) && id !== "mock");
+    if (cleaned.length > 0) {
+      return cleaned;
+    }
+    const current = this.getString("defaultProvider", "chatgpt");
+    return [current, ...listProviders().map((provider) => provider.id).filter((id) => id !== current && id !== "mock")];
+  }
+
+  private providerLabel(providerId: string): string {
+    return getProvider(providerId)?.label ?? providerId;
+  }
+
+  /** Current request lifecycle, for the panel and the status command. */
+  getRequestStatus(): { phase: string; providerId: string; detail?: string } | undefined {
+    return this.activeRequest
+      ? {
+          phase: describePhase(this.activeRequest.phase),
+          providerId: this.providerLabel(this.activeRequest.providerId),
+          detail: this.activeRequest.detail
+        }
+      : undefined;
+  }
+
   /** Ask before running commands the dangerous-command guard flagged (full-access mode only). */
   private async confirmDangerousTools(tools: readonly AgentToolRequest[]): Promise<boolean> {
     const detail = tools
@@ -909,10 +1184,12 @@ export class WebChatController implements vscode.Disposable {
         const result = await this.execCommand(tool.command);
         this.emitters.commandOutput.fire({ command: `$ ${tool.command}`, output: result.output, exitCode: result.exitCode });
         transcript.push(`$ ${tool.command}\n(exit code ${result.exitCode})\n${result.output || "(no output)"}`);
+        this.rememberToolResult(`$ ${tool.command} (exit ${result.exitCode})`, result.output);
       } else {
         const result = await executeReadonlyTool(tool);
         this.emitters.commandOutput.fire({ command: result.label, output: result.output, exitCode: result.ok ? 0 : 1 });
         transcript.push(`# ${result.label}\n${result.output || "(no output)"}`);
+        this.rememberToolResult(result.label, result.output);
       }
     }
 
@@ -1037,6 +1314,9 @@ export class WebChatController implements vscode.Disposable {
       this.emitters.applyResult.fire({
         applied: applied.map((change) => ({ path: change.path, action: change.action }))
       });
+      for (const change of applied) {
+        this.taskProgress.changedFiles.push({ path: change.path, action: change.action });
+      }
       this.emitters.notice.fire({
         level: "info",
         message: `Applied ${applied.length} file change${applied.length === 1 ? "" : "s"}. Undo: /undo or the card's Undo button.`
@@ -1183,6 +1463,10 @@ export class WebChatController implements vscode.Disposable {
     this.pendingFeedback = [];
     this.pendingNotes = [];
     this.handledTurnIds.clear();
+    this.clearRequestWatchdog();
+    this.activeRequest = undefined;
+    this.taskProgress = { objective: "", toolResults: [], errors: [], changedFiles: [], relevantFiles: [] };
+    this.failoverCount = 0;
     this.bridgeSessionId = randomUUID();
     await this.context.globalState.update("webchat.bridge.sessionId", this.bridgeSessionId);
     await this.context.globalState.update("webchat.session.summary", "");
@@ -1724,6 +2008,7 @@ export class WebChatController implements vscode.Disposable {
       agentMode: this.getAgentMode(),
       applyMode: this.getApplyMode(),
       autoRepair: config.get("agent.autoRepairInvalidResponses", true),
+      failoverMode: config.get("failover.mode", "off"),
       maxToolIterations: config.get("agent.maxToolIterations", 0),
       confirmDangerousCommands: config.get("agent.confirmDangerousCommands", true),
       messageLimit: this.getProviderMessageLimit(config.get("defaultProvider", "chatgpt")),
@@ -2614,5 +2899,41 @@ function safeHostId(url: unknown): string {
     return normalizeId(new URL(url.trim()).hostname);
   } catch {
     return "";
+  }
+}
+
+/** Map a bridge message to a request-lifecycle event (undefined = not lifecycle-relevant). */
+function requestEventFor(message: BridgeEnvelope): RequestEvent | undefined {
+  switch (message.type) {
+    case "chat.state": {
+      const payload = message.payload as { state?: unknown; detail?: unknown };
+      return typeof payload?.state === "string"
+        ? { kind: "page-state", state: payload.state, detail: typeof payload.detail === "string" ? payload.detail : undefined }
+        : undefined;
+    }
+    case "chat.stream.delta":
+      return { kind: "delta" };
+    case "chat.stream.done":
+      return { kind: "response-done" };
+    case "chat.error": {
+      const payload = message.payload as { detail?: unknown };
+      return { kind: "transport-error", detail: typeof payload?.detail === "string" ? payload.detail : undefined };
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** What the new provider is allowed to do, in words, for the handover package. */
+function describePermissions(mode: "ask" | "auto" | "plan" | "bypass"): string {
+  switch (mode) {
+    case "bypass":
+      return "Full access: file edits are applied automatically and shell commands run automatically.";
+    case "auto":
+      return "Auto-edit: file edits are applied automatically; shell commands need the user's approval.";
+    case "plan":
+      return "Plan only: do not edit files or run commands.";
+    default:
+      return "Ask: the user reviews a diff before edits are applied, and approves shell commands.";
   }
 }

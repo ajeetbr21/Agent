@@ -397,7 +397,9 @@ async function insertPrompt(envelope, isRetry = false) {
       return;
     }
 
-    sendState("submitting", submitted.detail);
+    // "submitted" is the acceptance point: from here the provider may be generating, so the IDE will
+    // not resend this prompt to another provider. Anything less stays "submitting"/"prompt-inserted".
+    sendState(submitted.submitted ? "submitted" : "prompt-inserted", submitted.detail);
     setTimeout(() => {
       void dismissBlockingUi();
     }, 1000);
@@ -520,7 +522,7 @@ async function submitPrompt(target) {
 
   if (button) {
     button.click();
-    return { detail: "Prompt inserted and submitted via send button." };
+    return { submitted: true, detail: "Prompt inserted and submitted via send button." };
   }
 
   // Fallbacks only when definitely NOT generating, so we can't accidentally stop a response.
@@ -529,7 +531,7 @@ async function submitPrompt(target) {
 
     if (form instanceof HTMLFormElement) {
       form.requestSubmit();
-      return { detail: "Prompt inserted and submitted via chat form." };
+      return { submitted: true, detail: "Prompt inserted and submitted via chat form." };
     }
 
     target.dispatchEvent(new KeyboardEvent("keydown", {
@@ -539,10 +541,12 @@ async function submitPrompt(target) {
       cancelable: true
     }));
 
-    return { detail: "Prompt inserted and submitted via Enter fallback." };
+    return { submitted: true, detail: "Prompt inserted and submitted via Enter fallback." };
   }
 
-  return { detail: "A response is still generating — inserted the next part without interrupting it." };
+  // Inserted but deliberately NOT sent (a reply is still streaming) — the IDE must not treat this as
+  // "the provider has the prompt".
+  return { submitted: false, detail: "A response is still generating — inserted the next part without interrupting it." };
 }
 
 /** True while the assistant is streaming a response (a Stop control is visible). */

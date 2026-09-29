@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — request tracking and safe provider failover
+
+- Every dispatched prompt now has a tracked lifecycle (sent → submitted → streaming → completed, or
+  failed-before-submit / unclear / cancelled), so a failure can be classified instead of guessed.
+  **LeechCode: Show Request Status** reports it.
+- **Provider failover** (`webchat.failover.mode`: off · safe · always, `webchat.failover.providers`):
+  a task can be continued on another provider. It is only automatic when the prompt provably never
+  reached the previous provider; after an ambiguous failure LeechCode asks, because replaying could
+  duplicate edits and commands.
+- **Continuation package:** since a provider's chat history cannot be transferred, the handover is
+  built locally — objective, files already changed, tool results, errors, compacted project state,
+  permissions and the undo checkpoint — and sent as the first message of a fresh chat, with an
+  explicit warning to verify the workspace when the previous provider may already have acted.
+- Providers that fail twice in a row are skipped for five minutes when choosing a failover target.
+- **Request watchdog** (`webchat.request.timeoutSeconds`, default 120): a page that goes silent now
+  fails the request instead of stalling the task forever.
+- **Fixed:** the content script reported `submitting` both while *retrying to find the input box* and
+  after actually sending, so a prompt that never reached the provider looked accepted (and would have
+  blocked a safe failover). It now emits a distinct `submitted` state only when the send control was
+  really activated — and a prompt it deliberately did not send (because a reply was still streaming)
+  is reported as `prompt-inserted`. Verified against a real browser with a login-wall page, a silent
+  page and a working page.
+
 ## Unreleased — full access, VS Code context, precise edits, undo
 
 - **Full access mode** (was "Bypass"): edits are applied and commands run with no approvals, with a

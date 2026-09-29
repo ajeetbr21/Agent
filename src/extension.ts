@@ -43,6 +43,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("webchat.copyPrompt", () => controller?.copyPrompt()),
     vscode.commands.registerCommand("webchat.copyContext", copyContext),
     vscode.commands.registerCommand("webchat.showSessionStatus", showSessionStatus),
+    vscode.commands.registerCommand("webchat.showRequestStatus", showRequestStatus),
     vscode.commands.registerCommand("webchat.configureSessionBudget", () => provider.reveal("settings")),
     vscode.commands.registerCommand("webchat.resetSession", () => controller?.resetSession()),
     vscode.commands.registerCommand("webchat.compactSessionNow", async () => {
@@ -104,6 +105,20 @@ async function showBridgeStatus(): Promise<void> {
   await vscode.window.showInformationMessage("WebChat browser bridge status", {
     modal: true,
     detail: [`Port: ${status.port}`, `Connected browser clients: ${status.clientCount}`].join("\n")
+  });
+}
+
+async function showRequestStatus(): Promise<void> {
+  const status = controller?.getRequestStatus();
+  if (!status) {
+    await vscode.window.showInformationMessage("No request has been sent yet in this session.");
+    return;
+  }
+  await vscode.window.showInformationMessage("LeechCode request status", {
+    modal: true,
+    detail: [`Provider: ${status.providerId}`, `State: ${status.phase}`, status.detail ? `Detail: ${status.detail}` : ""]
+      .filter(Boolean)
+      .join("\n")
   });
 }
 

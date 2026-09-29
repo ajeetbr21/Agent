@@ -48,6 +48,8 @@ export interface BridgeStatusInfo {
 }
 
 export interface WebChatSettings {
+  /** off · safe · always — what happens when a request fails in the browser. */
+  readonly failoverMode: string;
   readonly defaultProvider: string;
   readonly includeSelectionOnly: boolean;
   readonly autoSubmit: boolean;

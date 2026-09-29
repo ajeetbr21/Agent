@@ -141,6 +141,19 @@ Not limited to the built-ins — any web chat with a message box works:
 
 The extension guesses the message box, the Send button (even icon-only ones) and the reply area. If it guesses wrong, right-click the correct element on that page → **WebChat Bridge** → *Use as chat input / Send button / assistant reply*. Picks are saved per site and can be reset on the options page. This also works for fixing a built-in provider after a redesign.
 
+## When a request fails (provider failover)
+
+A browser page is a lossy transport: a tab closes, a login wall appears, the page goes quiet. LeechCode tracks how far each request got, because that decides what is safe to do next:
+
+| Where it failed | What happens |
+| --- | --- |
+| The prompt never reached the provider (no browser connected, no input box, login wall, page still retrying) | **Safe** — the task can be handed to another provider automatically |
+| The prompt was submitted, then the page failed or went silent | **Unclear** — the provider may already have edited files or run commands, so it is never resent automatically; LeechCode asks first |
+
+Set `webchat.failover.mode` (⚙ Settings → Agent) to `off` (just tell me), `safe` (hand over only when nothing was sent) or `always` (also offer after an unclear failure). `webchat.failover.providers` sets the order to try, and a provider that fails twice in a row is skipped for five minutes.
+
+Because a provider's own chat history can't be moved, the handover is built locally and sent as the first message of a fresh chat: the objective, files already changed, tool output already gathered, the errors, the compacted project state, and — after an unclear failure — an instruction to check the workspace with `read_file`/`git_diff`/`diagnostics` before changing anything. **LeechCode: Show Request Status** shows the current state; `webchat.request.timeoutSeconds` (default 120) bounds how long a silent page is waited for.
+
 ## When a provider changes its page
 
 Chat sites update their HTML often. Everything page-specific lives in **one file** — `browser-extension/src/content.js` — and **[docs/provider-adapters.md](docs/provider-adapters.md)** explains exactly which selector list to edit for each symptom (input not found, won't submit, no streaming, pop-up not dismissed, Stop, model switch), how to find a stable selector in DevTools in ~2 minutes, and how to reload. You can fix a provider yourself without waiting for a LeechCode update.

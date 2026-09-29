@@ -172,6 +172,17 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
           step={1}
           onChange={(value) => update("maxToolIterations", value)}
         />
+        <SelectField
+          label="If a request fails in the browser"
+          hint="LeechCode can hand the task to another provider using a handover it builds locally (objective, files already changed, tool output). It never replays a request the provider may already have acted on without asking."
+          value={settings.failoverMode}
+          options={[
+            { value: "off", label: "Just tell me (retry or switch myself)" },
+            { value: "safe", label: "Switch provider when nothing was sent yet" },
+            { value: "always", label: "Also offer to switch after an unclear failure" }
+          ]}
+          onChange={(value) => update("failoverMode", value)}
+        />
         <ToggleField
           label="Confirm dangerous commands in full access"
           hint="Still ask before commands that could wipe data: deleting a drive/home folder, formatting disks, force-push, git reset --hard, curl | sh, sudo, shutdown."
