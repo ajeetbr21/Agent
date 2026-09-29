@@ -4,6 +4,7 @@ import * as http from "http";
 import * as net from "net";
 import type { BridgeEnvelope, ChatPromptPayload } from "./protocol";
 import { createEnvelope } from "./protocol";
+import { isAllowedBridgeOrigin, tokensMatch } from "./pairing";
 import {
   createWebSocketAccept,
   decodeFrames,
@@ -30,6 +31,14 @@ export interface BridgeStatus {
   readonly browserClients: readonly BridgeClientInfo[];
 }
 
+/** What `/health` reveals to callers that did not present the pairing token. */
+export interface PublicBridgeStatus {
+  readonly running: boolean;
+  readonly port: number;
+  readonly clientCount: number;
+  readonly authenticated: false;
+}
+
 interface BridgeClient {
   readonly info: BridgeClientInfo;
   socket: net.Socket;
@@ -47,7 +56,11 @@ export class LocalBridgeServer {
   private server: http.Server | undefined;
   private pingTimer: NodeJS.Timeout | undefined;
 
-  constructor(private readonly options: BridgeServerOptions) {}
+  constructor(private readonly options: BridgeServerOptions) {
+    if (!options.token) {
+      throw new Error("LocalBridgeServer requires a non-empty pairing token.");
+    }
+  }
 
   onMessage(listener: (message: BridgeEnvelope) => void): () => void {
     this.events.on("message", listener);
@@ -187,8 +200,25 @@ export class LocalBridgeServer {
   ): Promise<void> {
     const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
 
+    if (!isAllowedBridgeOrigin(readHeader(request, "origin"))) {
+      this.sendJson(response, 403, { error: "Forbidden origin" });
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/health") {
-      this.sendJson(response, 200, this.getStatus());
+      // Anyone local may learn whether the bridge is up; client details need the token.
+      if (this.isAuthorizedHttpRequest(request, url)) {
+        this.sendJson(response, 200, { ...this.getStatus(), authenticated: true });
+      } else {
+        const status = this.getStatus();
+        const publicStatus: PublicBridgeStatus = {
+          running: status.running,
+          port: status.port,
+          clientCount: status.browserClients.length,
+          authenticated: false
+        };
+        this.sendJson(response, 200, publicStatus);
+      }
       return;
     }
 
@@ -219,11 +249,8 @@ export class LocalBridgeServer {
   }
 
   private isAuthorizedHttpRequest(request: http.IncomingMessage, url: URL): boolean {
-    const headerToken = request.headers["x-webchat-token"];
-    const token = url.searchParams.get("token") ||
-      (Array.isArray(headerToken) ? headerToken[0] : headerToken);
-
-    return token === this.options.token;
+    const token = readHeader(request, "x-webchat-token") || url.searchParams.get("token");
+    return tokensMatch(token, this.options.token);
   }
 
   private sendJson(response: http.ServerResponse, statusCode: number, payload: unknown): void {
@@ -236,7 +263,13 @@ export class LocalBridgeServer {
     const token = url.searchParams.get("token");
     const key = request.headers["sec-websocket-key"];
 
-    if (token !== this.options.token || typeof key !== "string") {
+    if (!isAllowedBridgeOrigin(readHeader(request, "origin"))) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    if (!tokensMatch(token, this.options.token) || typeof key !== "string") {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
       return;
@@ -323,6 +356,11 @@ export class LocalBridgeServer {
       this.removeClient(client.info.id);
     }
   }
+}
+
+function readHeader(request: http.IncomingMessage, name: string): string | undefined {
+  const value = request.headers[name];
+  return Array.isArray(value) ? value[0] : value;
 }
 
 async function readJsonBody(request: http.IncomingMessage): Promise<unknown> {

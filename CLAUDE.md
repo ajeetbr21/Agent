@@ -156,8 +156,12 @@ Settings namespace `webchat.*`: `defaultProvider`, `prompt.includeSelectionOnly`
 budget knobs, `context.maxIndexChars` (single-message paste budget), `provider.maxMessageChars` +
 `provider.maxSessionChars` (per-provider override maps for the per-message and per-conversation char
 windows), and `index.chunked` / `index.maxChunks` (chunked whole-codebase indexing).
-⚠ `bridge.port` (53451) and `bridge.token` ("webchat-dev-token") are **hard-coded** in
-`browser-extension/src/offscreen.js` — change both sides together.
+Bridge pairing: the token is a random per-install secret generated on first start and kept in
+VS Code SecretStorage (`webchat.bridge.pairingToken`), resolved by `src/bridge/pairing.ts`
+(`webchat.bridge.token` is an optional application-scope override ≥ 24 chars; the legacy
+"webchat-dev-token" is always rejected). The browser side stores port + token in
+`chrome.storage.local` via `browser-extension/options.html`; `background.js` pushes them to the
+offscreen socket. The server compares tokens in constant time and refuses non-extension `Origin`s.
 
 ---
 

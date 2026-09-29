@@ -1,5 +1,10 @@
 const SESSION_ID = "browser-extension";
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
+const DEFAULT_BRIDGE_PORT = 53451;
+// chrome.storage.local keys (written by options.html).
+const STORAGE_PORT_KEY = "bridgePort";
+const STORAGE_TOKEN_KEY = "bridgeToken";
+const STORAGE_STATUS_KEY = "bridgeStatus";
 const PROVIDER_URL_PATTERNS = [
   "https://chatgpt.com/*",
   "https://claude.ai/*",
@@ -14,9 +19,23 @@ const PROVIDER_URL_PATTERNS = [
 let creatingOffscreenDocument;
 let pendingPromptByTab = new Map();
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(async (details) => {
   void ensureBridge();
   chrome.alarms.create("webchat.bridge.reconnect", { periodInMinutes: 0.25 });
+  // First install: the extension can't connect until it has the IDE's pairing token.
+  if (details?.reason === "install" && !(await getBridgeConfig()).token) {
+    void chrome.runtime.openOptionsPage();
+  }
+});
+
+chrome.action.onClicked.addListener(() => {
+  void chrome.runtime.openOptionsPage();
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && (changes[STORAGE_PORT_KEY] || changes[STORAGE_TOKEN_KEY])) {
+    void reconfigureBridge();
+  }
 });
 
 chrome.runtime.onStartup.addListener(() => {
@@ -31,6 +50,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type === "webchat.offscreen.ready") {
+    void sendConnect();
+    return false;
+  }
+
+  if (message?.type === "webchat.offscreen.status") {
+    void chrome.storage.local.set({ [STORAGE_STATUS_KEY]: message.status });
     return false;
   }
 
@@ -80,9 +105,27 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 void ensureBridge();
 
+async function getBridgeConfig() {
+  const stored = await chrome.storage.local.get([STORAGE_PORT_KEY, STORAGE_TOKEN_KEY]);
+  const port = Number(stored[STORAGE_PORT_KEY]) || DEFAULT_BRIDGE_PORT;
+  const token = typeof stored[STORAGE_TOKEN_KEY] === "string" ? stored[STORAGE_TOKEN_KEY].trim() : "";
+  return { port, token };
+}
+
 async function ensureBridge() {
   await ensureOffscreenDocument();
-  await chrome.runtime.sendMessage({ type: "webchat.bridge.connect" });
+  await sendConnect();
+}
+
+async function sendConnect() {
+  const config = await getBridgeConfig();
+  await chrome.runtime.sendMessage({ type: "webchat.bridge.connect", config }).catch(() => {});
+}
+
+async function reconfigureBridge() {
+  await ensureOffscreenDocument();
+  const config = await getBridgeConfig();
+  await chrome.runtime.sendMessage({ type: "webchat.bridge.configure", config }).catch(() => {});
 }
 
 async function ensureOffscreenDocument() {

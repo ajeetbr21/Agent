@@ -19,6 +19,17 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("webchat.openSettings", () => provider.reveal("settings")),
     vscode.commands.registerCommand("webchat.startBridge", () => controller?.startBridge(false)),
     vscode.commands.registerCommand("webchat.showBridgeStatus", showBridgeStatus),
+    vscode.commands.registerCommand("webchat.copyBridgeToken", () => controller?.copyBridgeToken()),
+    vscode.commands.registerCommand("webchat.regenerateBridgeToken", async () => {
+      const choice = await vscode.window.showWarningMessage(
+        "Generate a new bridge pairing token? Every paired browser disconnects until you paste the new token into it.",
+        { modal: true },
+        "Regenerate"
+      );
+      if (choice === "Regenerate") {
+        await controller?.regenerateBridgeToken();
+      }
+    }),
     vscode.commands.registerCommand("webchat.openProvider", () => controller?.openExternalProvider()),
     vscode.commands.registerCommand("webchat.sendPromptToBrowser", async () => {
       await provider.reveal("chat");

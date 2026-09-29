@@ -84,6 +84,16 @@
         "category": "LeechCode"
       },
       {
+        "command": "webchat.copyBridgeToken",
+        "title": "Copy Bridge Pairing Token",
+        "category": "LeechCode"
+      },
+      {
+        "command": "webchat.regenerateBridgeToken",
+        "title": "Regenerate Bridge Pairing Token",
+        "category": "LeechCode"
+      },
+      {
         "command": "webchat.openProvider",
         "title": "Open Web Chat",
         "category": "LeechCode"
@@ -233,8 +243,9 @@
         },
         "webchat.bridge.token": {
           "type": "string",
-          "default": "webchat-dev-token",
-          "description": "Shared local bridge token. Keep the browser extension token in sync."
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Advanced override for the bridge pairing token. Leave empty (recommended) to use the random per-install token kept in the OS keychain — copy it with **LeechCode: Copy Bridge Pairing Token**. Values shorter than 24 characters, or the old `webchat-dev-token`, are ignored."
         },
         "webchat.browser.autoSubmit": {
           "type": "boolean",

@@ -51,7 +51,8 @@ export interface WebChatSettings {
   readonly indexChunked: boolean;
   readonly currentProviderLabel: string;
   readonly bridgePort: number;
-  readonly bridgeToken: string;
+  /** True when the `webchat.bridge.token` setting overrides the generated pairing token. */
+  readonly bridgeTokenCustom: boolean;
   readonly maxContextTokens: number;
   readonly maxInputTokens: number;
   readonly maxOutputTokens: number;
@@ -156,6 +157,8 @@ export type WebviewToHost =
   | { readonly type: "launchBrowser" }
   | { readonly type: "closeBrowser" }
   | { readonly type: "startBridge" }
+  | { readonly type: "copyBridgeToken" }
+  | { readonly type: "regenerateBridgeToken" }
   | { readonly type: "sessionAction"; readonly action: "compact" | "rotate" | "reset" }
   | { readonly type: "applyChanges"; readonly turnId?: string; readonly files: readonly FileChangeInfo[] }
   | { readonly type: "previewChanges"; readonly turnId?: string; readonly path?: string }

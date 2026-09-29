@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — secure bridge pairing
+
+- **Security:** the bridge no longer uses the shared, public `webchat-dev-token`. Each install
+  generates a random 256-bit pairing token on first start and keeps it in the OS keychain
+  (VS Code SecretStorage), never in `settings.json`.
+- New commands **LeechCode: Copy Bridge Pairing Token** / **Regenerate Bridge Pairing Token**, and
+  matching buttons in ⚙ Settings → Bridge (the token itself is no longer shown or editable there).
+- Browser extension: new options page (toolbar icon) to paste the token and port, with live status
+  (connected / token rejected / IDE not reachable). Opens automatically on first install.
+- Bridge server: constant-time token comparison; WebSocket upgrades and HTTP requests from web-page
+  origins are refused (403); unauthenticated `/health` only reports liveness and client count.
+- `webchat.bridge.token` is now an optional application-scope override (≥ 24 chars).
+- `scripts/verify-live-bridge.mjs` requires the token (argument or `WEBCHAT_BRIDGE_TOKEN`).
+
 ## 0.0.17 — initial public release
 
 First public cut of **LeechCode** — drive a real, logged-in web AI chat (ChatGPT, Claude, Gemini,

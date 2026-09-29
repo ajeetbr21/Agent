@@ -621,6 +621,11 @@ body {
   font-size: 12px;
   margin-bottom: 4px;
 }
+.bridge-token-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 
 /* ============================================================================
    LeechCode UI polish (appended so these rules win on equal specificity)

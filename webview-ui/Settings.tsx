@@ -187,12 +187,27 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
           step={1}
           onChange={(value) => update("bridgePort", value)}
         />
-        <TextField
-          label="Token"
-          hint="Shared secret. Keep the browser extension token identical."
-          value={settings.bridgeToken}
-          onChange={(value) => update("bridgeToken", value)}
-        />
+        <div className="field">
+          <span className="field-label">Pairing token</span>
+          <span className="field-hint">
+            {settings.bridgeTokenCustom
+              ? "Using the custom webchat.bridge.token user setting."
+              : "A private random token stored in your OS keychain."}{" "}
+            Paste it into the WebChat Bridge browser extension (click its toolbar icon). It is never shown here or written to settings.json.
+          </span>
+          <div className="bridge-token-actions">
+            <button className="btn ghost" onClick={() => post({ type: "copyBridgeToken" })}>
+              Copy pairing token
+            </button>
+            <button
+              className="btn ghost"
+              title="Disconnects every paired browser until the new token is pasted into it"
+              onClick={() => post({ type: "regenerateBridgeToken" })}
+            >
+              Regenerate
+            </button>
+          </div>
+        </div>
       </Section>
     </div>
   );

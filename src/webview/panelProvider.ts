@@ -115,6 +115,13 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
       case "startBridge":
         await this.controller.startBridge(false);
         return;
+      case "copyBridgeToken":
+        await this.controller.copyBridgeToken();
+        return;
+      case "regenerateBridgeToken":
+        // Goes through the command so the user gets the same confirmation dialog.
+        await vscode.commands.executeCommand("webchat.regenerateBridgeToken");
+        return;
       case "sessionAction":
         if (message.action === "compact") {
           await this.controller.compactNow();

@@ -80,9 +80,10 @@ This installs into your **existing editor** (current profile) — it does **not*
 ### 4. Connect and go
 
 1. In the editor, open the **LeechCode** panel. The status strip shows the bridge state.
-2. Click **open chat tab** (or just open chatgpt.com / claude.ai / … in the browser that has the extension). The extension connects to the local bridge at `ws://127.0.0.1:53451` automatically — the dot turns green: `1 browser connected`.
-3. Log into the chat provider once in that browser (your session persists).
-4. Type a task in the panel and hit **Send**. For the fully hands-off loop, enable `webchat.browser.autoSubmit` in Settings (⚙ in the panel).
+2. **Pair once:** on first start the editor generates a private pairing token (kept in the OS keychain). Click **Copy pairing token** on the toast (or run **LeechCode: Copy Bridge Pairing Token**), then click the WebChat Bridge toolbar icon in the browser, paste it and hit **Save & connect**. The options page shows the connection state.
+3. Click **open chat tab** (or just open chatgpt.com / claude.ai / … in the browser that has the extension). The extension connects to `ws://127.0.0.1:53451` — the dot turns green: `1 browser connected`.
+4. Log into the chat provider once in that browser (your session persists).
+5. Type a task in the panel and hit **Send**. For the fully hands-off loop, enable `webchat.browser.autoSubmit` in Settings (⚙ in the panel).
 
 ---
 
@@ -110,7 +111,7 @@ This installs into your **existing editor** (current profile) — it does **not*
 
 **Key settings** (all under the `webchat.*` namespace, editable in the in-panel ⚙ Settings or VS Code settings): `defaultProvider`, `agent.mode`, `browser.autoSubmit`, `provider.maxMessageChars` / `provider.maxSessionChars` (per-provider windows), `index.chunked` / `index.maxChunks`, `context.maxIndexChars` / `context.maxTreeChars`, `diff.showOnApply`, `vision.*` (local image→text), `session.*` (budget / compaction / rotation), `bridge.port` / `bridge.token`.
 
-> ⚠️ `bridge.port` (53451) and `bridge.token` are mirrored in `browser-extension/src/offscreen.js` — change both sides together.
+> 🔐 The bridge only accepts connections that present the per-install pairing token, and refuses WebSocket/HTTP requests coming from web-page origins. `bridge.token` is an optional advanced override (≥ 24 chars; the old `webchat-dev-token` is rejected). If you change `bridge.port`, set the same port on the browser extension's options page. **LeechCode: Regenerate Bridge Pairing Token** rotates the token and disconnects every paired browser.
 
 ## When a provider changes its page
 

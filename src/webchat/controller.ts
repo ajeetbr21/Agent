@@ -17,6 +17,12 @@ import type {
 import { createEnvelope } from "../bridge/protocol";
 import { LocalBridgeServer } from "../bridge/localBridgeServer";
 import {
+  generatePairingToken,
+  MIN_BRIDGE_TOKEN_LENGTH,
+  resolveBridgeToken,
+  type BridgeTokenSource
+} from "../bridge/pairing";
+import {
   buildAgentResponseRepairPrompt,
   buildAgentToolInstructions,
   parseAgentResponse,
@@ -66,6 +72,8 @@ const DEFAULT_MAX_INDEX_CHUNKS = 80;
 /** How many times to re-send a chunk that looked blocked (page busy / login overlay) before stopping. */
 const MAX_INDEX_CHUNK_RETRIES = 2;
 
+const BRIDGE_TOKEN_SECRET_KEY = "webchat.bridge.pairingToken";
+
 const SETTING_PATHS: Record<string, string> = {
   defaultProvider: "defaultProvider",
   includeSelectionOnly: "prompt.includeSelectionOnly",
@@ -78,7 +86,6 @@ const SETTING_PATHS: Record<string, string> = {
   visionEndpoint: "vision.endpoint",
   visionModel: "vision.model",
   bridgePort: "bridge.port",
-  bridgeToken: "bridge.token",
   maxContextTokens: "session.maxContextTokens",
   maxInputTokens: "session.maxInputTokens",
   maxOutputTokens: "session.maxOutputTokens",
@@ -142,6 +149,10 @@ export class WebChatController implements vscode.Disposable {
   private bridge: LocalBridgeServer | undefined;
   private bridgeMessageDisposable: (() => void) | undefined;
   private bridgeSessionId: string;
+  /** Where the running bridge's token came from (drives the Settings UI and regenerate warnings). */
+  private bridgeTokenSource: BridgeTokenSource | undefined;
+  private activeBridgeToken: string | undefined;
+  private bridgeStarting: Promise<void> | undefined;
   private usage: SessionUsage = { promptCount: 0, inputTokensUsed: 0, outputTokensUsed: 0 };
   private activeAssistantText = "";
   private currentTurnId: string | undefined;
@@ -238,13 +249,25 @@ export class WebChatController implements vscode.Disposable {
 
   // ---- bridge ----------------------------------------------------------------------------------
   async startBridge(silent: boolean): Promise<void> {
+    // Activation and the webview's "ready" both start the bridge; serialize them so only one
+    // server binds the port and only one token is ever generated.
+    if (!this.bridgeStarting) {
+      this.bridgeStarting = this.startBridgeOnce(silent).finally(() => {
+        this.bridgeStarting = undefined;
+      });
+    }
+    return this.bridgeStarting;
+  }
+
+  private async startBridgeOnce(silent: boolean): Promise<void> {
     if (this.bridge?.getStatus().running) {
       return;
     }
 
     const config = vscode.workspace.getConfiguration("webchat");
     const port = config.get<number>("bridge.port", 53451);
-    const token = config.get<string>("bridge.token", "webchat-dev-token");
+    const token = await this.getBridgeToken(true);
+    this.activeBridgeToken = token;
 
     this.bridge = new LocalBridgeServer({ port, token, sessionId: this.bridgeSessionId });
     this.bridgeMessageDisposable = this.bridge.onMessage((message) => this.handleBridgeMessage(message));
@@ -264,6 +287,82 @@ export class WebChatController implements vscode.Disposable {
     }
 
     this.emitters.status.fire(this.getBridgeStatus());
+  }
+
+  /**
+   * The pairing token the bridge requires. By default it is a random per-install secret kept in the
+   * editor's SecretStorage (OS keychain) — never in settings.json, so it can't leak into a repo.
+   * A strong `webchat.bridge.token` user setting overrides it; weak/legacy values are ignored.
+   */
+  private async getBridgeToken(announce: boolean): Promise<string> {
+    const configured = vscode.workspace.getConfiguration("webchat").get<string>("bridge.token", "");
+    const stored = await this.context.secrets.get(BRIDGE_TOKEN_SECRET_KEY);
+    const resolved = resolveBridgeToken(configured, stored);
+
+    if (resolved.source === "generated") {
+      await this.context.secrets.store(BRIDGE_TOKEN_SECRET_KEY, resolved.token);
+      this.output.appendLine("Generated a new bridge pairing token. Pair the browser extension with it.");
+      // First run (or after a keychain reset): the panel may not be open yet, so use a toast.
+      void vscode.window
+        .showInformationMessage(
+          "LeechCode generated a private bridge pairing token. Paste it into the WebChat Bridge browser extension (click its toolbar icon) to connect.",
+          "Copy pairing token"
+        )
+        .then((choice) => {
+          if (choice) {
+            void this.copyBridgeToken();
+          }
+        });
+    }
+    if (resolved.ignoredSetting && announce) {
+      const reason = resolved.ignoredSetting === "legacy"
+        ? "is the old public default"
+        : `is shorter than ${MIN_BRIDGE_TOKEN_LENGTH} characters`;
+      this.output.appendLine(`Ignoring webchat.bridge.token: it ${reason}. Using the generated pairing token.`);
+      this.emitters.notice.fire({
+        level: "warn",
+        message: `webchat.bridge.token ${reason} and was ignored; the generated pairing token is used instead.`
+      });
+    }
+
+    this.bridgeTokenSource = resolved.source === "setting" ? "setting" : "stored";
+    return resolved.token;
+  }
+
+  /** Copy the active pairing token so the user can paste it into the browser extension. */
+  async copyBridgeToken(): Promise<void> {
+    // Prefer the token the running bridge actually enforces (settings may have changed since).
+    const token = this.bridge?.getStatus().running && this.activeBridgeToken
+      ? this.activeBridgeToken
+      : await this.getBridgeToken(false);
+    await vscode.env.clipboard.writeText(token);
+    this.emitters.settings.fire(this.getSettings());
+    this.emitters.notice.fire({
+      level: "info",
+      message: "Bridge pairing token copied. Paste it in the WebChat Bridge extension options (click the extension icon)."
+    });
+  }
+
+  /** Replace the stored pairing token, restart the bridge and drop every paired browser. */
+  async regenerateBridgeToken(): Promise<void> {
+    await this.context.secrets.store(BRIDGE_TOKEN_SECRET_KEY, generatePairingToken());
+    if (this.bridgeTokenSource === "setting") {
+      this.emitters.notice.fire({
+        level: "warn",
+        message: "A new token was stored, but webchat.bridge.token is set and still takes precedence. Clear that setting to use the generated token."
+      });
+    }
+    await this.restartBridge();
+    await this.copyBridgeToken();
+  }
+
+  private async restartBridge(): Promise<void> {
+    await this.bridgeStarting;
+    this.bridgeMessageDisposable?.();
+    this.bridgeMessageDisposable = undefined;
+    this.bridge?.dispose();
+    this.bridge = undefined;
+    await this.startBridge(true);
   }
 
   getBridgeStatus(): BridgeStatusInfo {
@@ -1293,7 +1392,7 @@ export class WebChatController implements vscode.Disposable {
       indexChunked: config.get("index.chunked", true),
       currentProviderLabel: this.getCurrentProvider()?.label ?? "",
       bridgePort: config.get("bridge.port", 53451),
-      bridgeToken: config.get("bridge.token", "webchat-dev-token"),
+      bridgeTokenCustom: this.bridgeTokenSource === "setting",
       maxContextTokens: config.get("session.maxContextTokens", policy.budget.maxContextTokens),
       maxInputTokens: config.get("session.maxInputTokens", policy.budget.maxInputTokens),
       maxOutputTokens: config.get("session.maxOutputTokens", policy.budget.maxOutputTokens),
@@ -1328,10 +1427,10 @@ export class WebChatController implements vscode.Disposable {
     await vscode.workspace
       .getConfiguration("webchat")
       .update(path, value, vscode.ConfigurationTarget.Workspace);
-    if (key === "bridgePort" || key === "bridgeToken") {
+    if (key === "bridgePort") {
       this.emitters.notice.fire({
         level: "warn",
-        message: "Bridge port/token changed. Reload the window and re-pair the browser extension."
+        message: "Bridge port changed. Reload the window and set the same port in the browser extension options."
       });
     }
   }
