@@ -15,6 +15,7 @@ import {
   type SymbolEntry
 } from "./contextFormat";
 import { getWorkspaceRoot, resolveWorkspacePath } from "../workspace/applyAgentChanges";
+import { isSecretFile, redactSecrets, secretFileNotice } from "../prompt/redact";
 
 /**
  * Read-only access to what VS Code knows about the project — the Problems panel, open editors,
@@ -153,6 +154,9 @@ export async function gitStatus(): Promise<string> {
 }
 
 export async function gitDiff(relativePath?: string, staged = false): Promise<string> {
+  if (relativePath && isSecretFile(relativePath)) {
+    return secretFileNotice(relativePath);
+  }
   const pathArgs = ["--", relativePath ? validatedGitPath(relativePath) : "."];
   // --no-ext-diff / --no-textconv: never run a diff helper the repository's config points at.
   const base = ["diff", ...(staged ? ["--staged"] : []), "--no-color", "--no-ext-diff", "--no-textconv"];
@@ -163,7 +167,9 @@ export async function gitDiff(relativePath?: string, staged = false): Promise<st
     const other = staged ? "" : " (use staged: true for staged changes)";
     return `No ${scope}${other}.`;
   }
-  return truncateText(`git diff (${scope}):\n${stat.trim()}\n\n${diff}`, MAX_GIT_OUTPUT_CHARS);
+  // A committed .env or a staged key would otherwise travel inside the diff body.
+  const safeDiff = redactSecrets(diff).text;
+  return truncateText(`git diff (${scope}):\n${stat.trim()}\n\n${safeDiff}`, MAX_GIT_OUTPUT_CHARS);
 }
 
 export async function findWorkspaceSymbols(query: string): Promise<string> {

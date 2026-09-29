@@ -259,6 +259,12 @@
           "maximum": 500,
           "description": "Safety cap on the number of messages used to deliver a chunked codebase index. Files beyond this many messages are skipped."
         },
+        "webchat.privacy.redactSecrets": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "markdownDescription": "Never send credentials to a chat page. Files that exist to hold secrets (`.env*`, `*.pem`, `*.key`, `id_rsa`, `.npmrc`, `credentials`, keystores, service-account JSON) are not read at all, and anything that is sent — prompts, file context, command output, git diffs — is scanned so values that look like credentials (AWS/GitHub/OpenAI/Slack/Stripe tokens, JWTs, private keys, passwords in URLs, `SECRET=…` assignments) are masked. Placeholders and `process.env` lookups are left alone."
+        },
         "webchat.request.timeoutSeconds": {
           "type": "number",
           "default": 120,

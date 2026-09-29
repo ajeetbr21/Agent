@@ -36,6 +36,7 @@ import { dangerousCommandReason } from "../agent/commandSafety";
 import { buildCompactionPrompt } from "../prompt/compaction";
 import { buildPrompt } from "../prompt/buildPrompt";
 import { buildIndexPrimedNote, planIndexChunks } from "../prompt/indexChunker";
+import { isSecretFile, redactSecrets, redactionNote, secretFileNotice, SECRET_FILE_GLOBS } from "../prompt/redact";
 import { collectActiveEditorContext } from "../workspace/context";
 import {
   AgentChangeError,
@@ -142,6 +143,7 @@ const SETTING_PATHS: Record<string, string> = {
   autoRepair: "agent.autoRepairInvalidResponses",
   maxToolIterations: "agent.maxToolIterations",
   failoverMode: "failover.mode",
+  redactSecrets: "privacy.redactSecrets",
   confirmDangerousCommands: "agent.confirmDangerousCommands",
   indexChunked: "index.chunked",
   visionEnabled: "vision.enabled",
@@ -243,6 +245,8 @@ export class WebChatController implements vscode.Disposable {
   } = { objective: "", toolResults: [], errors: [], changedFiles: [], relevantFiles: [] };
   /** Fires when a request stops producing any page feedback, so a silent tab can't stall the task. */
   private requestWatchdog: NodeJS.Timeout | undefined;
+  /** Set once per session so the redaction notice isn't repeated on every turn. */
+  private redactionNoticeShown = false;
   /** Guard so one failed request triggers at most one failover. */
   private failoverInFlight = false;
   private failoverCount = 0;
@@ -581,7 +585,7 @@ export class WebChatController implements vscode.Disposable {
         payload: {
           providerId: provider.id,
           chatUrl: provider.chatUrl,
-          prompt,
+          prompt: this.protectOutgoing(prompt),
           promptNumber: this.usage.promptCount,
           expectedAction: action === "compact" || action === "rotate" ? action : "submit",
           autoSubmit: this.getBool("browser.autoSubmit", false),
@@ -902,6 +906,30 @@ export class WebChatController implements vscode.Disposable {
       }
       // ask/auto + webview + privileged tools: wait for the approval card (runCommands message).
     }
+  }
+
+  /**
+   * Last line of defence before anything leaves the machine: mask credential-looking values in the
+   * outgoing prompt. Everything sent to a provider page goes through here — user prompts, file
+   * context, command output, git diffs and handover packages — because a web chat is a third party.
+   */
+  private protectOutgoing(prompt: string): string {
+    if (!this.getBool("privacy.redactSecrets", true)) {
+      return prompt;
+    }
+    const result = redactSecrets(prompt);
+    if (result.count === 0) {
+      return prompt;
+    }
+    this.output.appendLine(`Masked ${result.count} credential value(s) before sending: ${result.kinds.join(", ")}`);
+    if (!this.redactionNoticeShown) {
+      this.redactionNoticeShown = true;
+      this.emitters.notice.fire({
+        level: "info",
+        message: `Masked ${result.count} credential value${result.count === 1 ? "" : "s"} (${result.kinds.join(", ")}) before sending to the chat. Turn off with webchat.privacy.redactSecrets.`
+      });
+    }
+    return `${result.text}\n\n${redactionNote(result)}`;
   }
 
   // ---- request lifecycle + provider failover ---------------------------------------------------
@@ -2009,6 +2037,7 @@ export class WebChatController implements vscode.Disposable {
       applyMode: this.getApplyMode(),
       autoRepair: config.get("agent.autoRepairInvalidResponses", true),
       failoverMode: config.get("failover.mode", "off"),
+      redactSecrets: config.get("privacy.redactSecrets", true),
       maxToolIterations: config.get("agent.maxToolIterations", 0),
       confirmDangerousCommands: config.get("agent.confirmDangerousCommands", true),
       messageLimit: this.getProviderMessageLimit(config.get("defaultProvider", "chatgpt")),
@@ -2158,7 +2187,7 @@ export class WebChatController implements vscode.Disposable {
       return { files: [], truncated: false };
     }
     const exclude =
-      "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/.vscode-test/**,**/*.vsix,**/*.lock,**/pnpm-lock.yaml,**/package-lock.json,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.webp,**/*.ico,**/*.pdf,**/*.zip,**/*.map}";
+      `{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/.vscode-test/**,**/*.vsix,**/*.lock,**/pnpm-lock.yaml,**/package-lock.json,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.webp,**/*.ico,**/*.pdf,**/*.zip,**/*.map,${SECRET_FILE_GLOBS}}`;
     const uris = await vscode.workspace.findFiles("**/*", exclude, 1500);
     const rels = uris.map((uri) => vscode.workspace.asRelativePath(uri, false)).sort((a, b) => a.localeCompare(b));
 
@@ -2254,7 +2283,7 @@ export class WebChatController implements vscode.Disposable {
               payload: {
                 providerId: provider.id,
                 chatUrl: provider.chatUrl,
-                prompt: chunk.text,
+                prompt: this.protectOutgoing(chunk.text),
                 promptNumber: this.usage.promptCount,
                 expectedAction: "submit",
                 autoSubmit: true,
@@ -2371,7 +2400,7 @@ export class WebChatController implements vscode.Disposable {
       return undefined;
     }
     const exclude =
-      "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/.vscode-test/**,**/*.vsix,**/*.map}";
+      `{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/.vscode-test/**,**/*.vsix,**/*.map,${SECRET_FILE_GLOBS}}`;
     let rels: string[];
     try {
       const uris = await vscode.workspace.findFiles("**/*", exclude, 3000);
@@ -2430,7 +2459,7 @@ export class WebChatController implements vscode.Disposable {
           files.push({ path: "GIT_CHANGES.txt", content: await this.describeGitChanges() });
         } else if (entry === OPEN_EDITORS_CONTEXT_TOKEN) {
           for (const rel of openEditorPaths()) {
-            await addFile(rel);
+            await addFile(rel); // addFile → readWorkspaceText, which skips secret files
           }
         } else if (entry.startsWith(FOLDER_CONTEXT_PREFIX)) {
           const folder = entry.slice(FOLDER_CONTEXT_PREFIX.length).replace(/\/+$/, "");
@@ -2470,7 +2499,7 @@ export class WebChatController implements vscode.Disposable {
     if (folder) {
       resolveWorkspacePath(root, folder); // rejects absolute / ../ paths
     }
-    const exclude = "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/build/**,**/.next/**,**/*.map,**/*.lock,**/*.min.js}";
+    const exclude = `{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/build/**,**/.next/**,**/*.map,**/*.lock,**/*.min.js,${SECRET_FILE_GLOBS}}`;
     // Base the pattern on the folder URI: a folder name containing glob characters (Next.js "app/[id]")
     // must be taken literally, not as a character class.
     const pattern = folder
@@ -2485,6 +2514,9 @@ export class WebChatController implements vscode.Disposable {
   /** A workspace file's text, or undefined if it is missing, binary or too large. */
   private async readWorkspaceText(root: vscode.WorkspaceFolder, rel: string): Promise<string | undefined> {
     try {
+      if (isSecretFile(rel)) {
+        return secretFileNotice(rel); // never send a credential file's contents
+      }
       const uri = resolveWorkspacePath(root, rel);
       const bytes = await vscode.workspace.fs.readFile(uri);
       if (bytes.byteLength > MAX_MENTION_FILE_BYTES) {
@@ -2649,7 +2681,7 @@ export class WebChatController implements vscode.Disposable {
         payload: {
           providerId: provider.id,
           chatUrl: provider.chatUrl,
-          prompt: repairPrompt,
+          prompt: this.protectOutgoing(repairPrompt),
           promptNumber: this.usage.promptCount,
           expectedAction: "continue",
           autoSubmit: this.getBool("browser.autoSubmit", false)

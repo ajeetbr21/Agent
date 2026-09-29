@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — credentials never leave the machine
+
+- **Secret files are never read** (`.env*`, `*.pem`, `*.key`, keystores, `id_rsa`, `.npmrc`, `.netrc`,
+  `.git-credentials`, `.ssh/`, `.aws/`, `credentials`, `secrets.*`, `service-account*.json`): skipped by
+  `@codebase`, `@folder`, `@open`, `search` and the `read_file` tool, which now returns a notice
+  instead of the contents. `*.example` / `*.sample` / `*.template` files stay readable.
+- **Everything sent is scanned** at one choke point — prompts, file context, command output, git
+  diffs, index chunks and provider handovers — masking AWS/GitHub/GitLab/Slack/Stripe/npm/OpenAI/
+  Anthropic/Google tokens, JWTs, private-key blocks, credentials inside connection strings and
+  `Authorization` headers, and the values of `PASSWORD=` / `API_KEY:` style assignments.
+- Placeholders, variable expansions and `process.env` lookups are left untouched, so example files and
+  ordinary code still make sense to the model, which is told when something was masked.
+- New setting `webchat.privacy.redactSecrets` (user-level, default on) and a Settings toggle.
+
 ## Unreleased — request tracking and safe provider failover
 
 - Every dispatched prompt now has a tracked lifecycle (sent → submitted → streaming → completed, or

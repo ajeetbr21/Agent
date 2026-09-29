@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { AgentToolRequest } from "./toolProtocol";
 import { getWorkspaceRoot, resolveWorkspacePath } from "../workspace/applyAgentChanges";
+import { isSecretFile, redactSecrets, secretFileNotice, SECRET_FILE_GLOBS } from "../prompt/redact";
 import {
   collectDiagnostics,
   collectOpenEditors,
@@ -82,6 +83,10 @@ export function describeTool(tool: AgentToolRequest): string {
 }
 
 async function readFileTool(path: string, startLine?: number, endLine?: number): Promise<ToolExecution> {
+  if (isSecretFile(path)) {
+    // The file exists only to hold credentials; the model gets a notice instead of its contents.
+    return { label: `read_file ${path}`, output: secretFileNotice(path), ok: true };
+  }
   const root = getWorkspaceRoot();
   const uri = resolveWorkspacePath(root, path);
   const bytes = await vscode.workspace.fs.readFile(uri);
@@ -96,7 +101,7 @@ async function readFileTool(path: string, startLine?: number, endLine?: number):
 
   const truncated = content.length > MAX_READ_CHARS;
   const body = truncated ? `${content.slice(0, MAX_READ_CHARS)}\n…[truncated ${content.length - MAX_READ_CHARS} chars]` : content;
-  return { label: `read_file ${path}`, output: body, ok: true };
+  return { label: `read_file ${path}`, output: redactSecrets(body).text, ok: true };
 }
 
 async function listDirTool(path: string): Promise<ToolExecution> {
@@ -112,7 +117,7 @@ async function listDirTool(path: string): Promise<ToolExecution> {
 }
 
 async function searchTool(query: string, glob?: string): Promise<ToolExecution> {
-  const exclude = "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/*.map,**/*.lock}";
+  const exclude = `{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/*.map,**/*.lock,${SECRET_FILE_GLOBS}}`;
   const uris = await vscode.workspace.findFiles(glob || "**/*", exclude, MAX_SEARCH_FILES);
   let regex: RegExp;
   try {
@@ -141,10 +146,13 @@ async function searchTool(query: string, glob?: string): Promise<ToolExecution> 
       continue;
     }
     const rel = vscode.workspace.asRelativePath(uri, false);
+    if (isSecretFile(rel)) {
+      continue; // belt and braces: the glob already excludes these
+    }
     const lines = text.split("\n");
     for (let i = 0; i < lines.length && matches.length < MAX_SEARCH_MATCHES; i += 1) {
       if (regex.test(lines[i])) {
-        matches.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+        matches.push(`${rel}:${i + 1}: ${redactSecrets(lines[i].trim().slice(0, 200)).text}`);
       }
     }
   }

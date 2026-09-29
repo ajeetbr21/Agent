@@ -50,6 +50,8 @@ export interface BridgeStatusInfo {
 export interface WebChatSettings {
   /** off · safe · always — what happens when a request fails in the browser. */
   readonly failoverMode: string;
+  /** Mask credentials, and never read credential files, before anything is sent to a chat page. */
+  readonly redactSecrets: boolean;
   readonly defaultProvider: string;
   readonly includeSelectionOnly: boolean;
   readonly autoSubmit: boolean;

@@ -141,6 +141,17 @@ Not limited to the built-ins — any web chat with a message box works:
 
 The extension guesses the message box, the Send button (even icon-only ones) and the reply area. If it guesses wrong, right-click the correct element on that page → **WebChat Bridge** → *Use as chat input / Send button / assistant reply*. Picks are saved per site and can be reset on the options page. This also works for fixing a built-in provider after a redesign.
 
+## Your secrets stay on your machine
+
+Everything LeechCode sends lands in a third-party web page, so credentials are held back in two layers (`webchat.privacy.redactSecrets`, on by default):
+
+1. **Files that exist to hold secrets are never read** — `.env` and `.env.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, keystores, `id_rsa`/`id_ed25519`, `.npmrc`, `.netrc`, `.git-credentials`, `.ssh/`, `.aws/`, `credentials`, `secrets.*`, `service-account*.json`. They are skipped by `@codebase`, `@folder`, `@open`, `search` and `read_file`; the agent gets a short notice instead of the contents. `*.example` / `*.sample` / `*.template` files stay fully readable.
+2. **Everything actually sent is scanned** — prompts, file context, command output, git diffs and provider handovers. Recognisable credentials are masked as `***REDACTED***`: AWS keys, GitHub/GitLab/Slack/Stripe/npm/OpenAI/Anthropic/Google tokens, JWTs, private-key blocks, passwords inside connection strings and `Authorization:` headers, plus the *value* of assignments such as `DB_PASSWORD=…` or `"apiKey": "…"`.
+
+Placeholders are deliberately left alone, so documentation and code keep working for the model: `API_KEY=your-key-here`, `TOKEN=${GITHUB_TOKEN}`, `password = process.env.DB_PASSWORD`, `sk_live_replace_me`. The model is told when something was masked, so it doesn't try to guess the value.
+
+> This is a safety net, not a guarantee — a credential in an unusual format can still slip through. Treat a chat you drive this way as you would any external service.
+
 ## When a request fails (provider failover)
 
 A browser page is a lossy transport: a tab closes, a login wall appears, the page goes quiet. LeechCode tracks how far each request got, because that decides what is safe to do next:

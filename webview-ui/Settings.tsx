@@ -172,6 +172,12 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
           step={1}
           onChange={(value) => update("maxToolIterations", value)}
         />
+        <ToggleField
+          label="Never send credentials"
+          hint="Skip files that hold secrets (.env, keys, certificates, credentials) and mask credential-looking values in everything sent — prompts, file context, command output, git diffs. Leave this on: a web chat is a third party."
+          checked={settings.redactSecrets}
+          onChange={(value) => update("redactSecrets", value)}
+        />
         <SelectField
           label="If a request fails in the browser"
           hint="LeechCode can hand the task to another provider using a handover it builds locally (objective, files already changed, tool output). It never replays a request the provider may already have acted on without asking."
