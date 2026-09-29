@@ -1,6 +1,9 @@
 import type { ProviderId, WebChatProvider } from "./types";
 import { parseCustomProviders, type CustomProviderAdapter } from "./custom";
 
+// maxSessionChars is each chat's conversation window: LeechCode starts a fresh chat when ~90% of it
+// is used (estimated at 4 chars/token). Claude and DeepSeek hard-stop long chats, so they stay
+// below their real limits; ChatGPT/Gemini/AI Studio/Qwen truncate or have very large windows.
 const builtInProviders: readonly WebChatProvider[] = [
   {
     id: "chatgpt",
@@ -8,7 +11,7 @@ const builtInProviders: readonly WebChatProvider[] = [
     host: "chatgpt.com",
     chatUrl: "https://chatgpt.com/",
     maxMessageChars: 12000,
-    maxSessionChars: 240000,
+    maxSessionChars: 800000,
     tags: ["chat", "vision"],
     imageSupport: "limited",
     models: ["Auto", "Instant", "Thinking"],
@@ -31,7 +34,7 @@ const builtInProviders: readonly WebChatProvider[] = [
     host: "gemini.google.com",
     chatUrl: "https://gemini.google.com/app",
     maxMessageChars: 12000,
-    maxSessionChars: 500000,
+    maxSessionChars: 3000000,
     tags: ["chat", "vision"],
     imageSupport: "generous",
     models: ["3 Flash", "3 Pro"]
@@ -42,7 +45,7 @@ const builtInProviders: readonly WebChatProvider[] = [
     host: "chat.qwen.ai",
     chatUrl: "https://chat.qwen.ai/",
     maxMessageChars: 8000,
-    maxSessionChars: 120000,
+    maxSessionChars: 600000,
     tags: ["chat", "vision"],
     imageSupport: "generous",
     models: ["Qwen3-Max", "Qwen3-Coder", "Qwen3-VL"]
@@ -53,7 +56,7 @@ const builtInProviders: readonly WebChatProvider[] = [
     host: "chat.deepseek.com",
     chatUrl: "https://chat.deepseek.com/",
     maxMessageChars: 12000,
-    maxSessionChars: 200000,
+    maxSessionChars: 400000,
     tags: ["chat"],
     imageSupport: "none",
     models: ["DeepSeek", "DeepThink"],

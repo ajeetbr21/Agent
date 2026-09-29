@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — fix "every message opens a new tab", bigger sessions
+
+- **Fixed:** once the session budget ran low, *every* following prompt was a "rotate" (usage was never
+  reset after rotating), and each rotate opened a brand-new browser tab. Rotation now resets the budget
+  for the new chat and reuses the provider's existing tab (navigates/reloads it to a fresh chat).
+- **Fixed:** output usage was summed per streaming delta; when a page re-rendered earlier text the
+  whole reply was counted again, exhausting the budget after one or two replies. It is now counted once
+  per reply.
+- **Fixed:** tool results, subagent tasks and repair prompts could trigger a rotate (landing in a new
+  chat that never saw the request) or a compaction turn that dropped them. They now always continue in
+  the same chat; compact/rotate is decided on user turns only.
+- **Fixed:** a scheduled compaction replaced the user's message. The message is now sent, with a request
+  for a thorough state summary alongside it.
+- **Fixed:** prompts were broadcast to every paired browser, so each opened its own tab and answered
+  (duplicate replies). A prompt now goes to one browser — the one with a live chat tab.
+- Prompts queued while no browser was connected are only replayed within 30 s, not whenever a browser
+  shows up later.
+- **Bigger sessions:** the global budget is now 1M context / 1M input / 400k output tokens (was
+  150k/120k/30k) and each provider's conversation window decides rotation: ChatGPT 800k chars
+  (was 240k), Gemini 3M (was 500k), Qwen 600k (was 120k), DeepSeek 400k (was 200k); Claude stays at
+  600k (it hard-stops long chats), AI Studio 4M. Compaction every 10 prompts (was 5).
+
 ## Unreleased — custom AI sites
 
 - **Use any web AI chat:** ⚙ Settings → *Custom AI sites* (setting `webchat.customProviders`) adds any

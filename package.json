@@ -220,7 +220,7 @@
           "additionalProperties": {
             "type": "number"
           },
-          "markdownDescription": "Per-provider total character budget for one chat conversation, e.g. `{ \"chatgpt\": 240000, \"claude\": 600000 }`. Caps how much of a whole-codebase index WebChat delivers so it doesn't overflow the session window. Editable per provider from the in-panel Settings."
+          "markdownDescription": "Per-provider total character budget for one chat conversation, e.g. `{ \"chatgpt\": 800000, \"claude\": 600000 }`. LeechCode starts a fresh chat when ~90% of it is used, and caps how much of a whole-codebase index it delivers. Editable per provider from the in-panel Settings."
         },
         "webchat.index.chunked": {
           "type": "boolean",
@@ -331,31 +331,31 @@
         },
         "webchat.session.maxContextTokens": {
           "type": "number",
-          "default": 150000,
+          "default": 1000000,
           "minimum": 1000,
-          "description": "Approximate total context-token budget for one web chat session before a fresh chat should be started."
+          "description": "Upper bound on the approximate token budget of one web chat before a fresh chat is started. Each provider's own conversation window (webchat.provider.maxSessionChars) caps it further."
         },
         "webchat.session.maxInputTokens": {
           "type": "number",
-          "default": 120000,
+          "default": 1000000,
           "minimum": 1000,
-          "description": "Approximate input-token budget for one web chat session."
+          "description": "Upper bound on the approximate input-token budget of one web chat (also capped by the provider's conversation window)."
         },
         "webchat.session.maxOutputTokens": {
           "type": "number",
-          "default": 30000,
+          "default": 400000,
           "minimum": 1000,
-          "description": "Approximate output-token budget for one web chat session."
+          "description": "Upper bound on the approximate output-token budget of one web chat (also capped by the provider's conversation window)."
         },
         "webchat.session.compactEveryPrompts": {
           "type": "number",
-          "default": 5,
+          "default": 10,
           "minimum": 1,
-          "description": "Ask the assistant for a compact development state after this many prompts."
+          "description": "Every N user prompts, also ask the assistant for a thorough compacted development state (the prompt itself is still sent)."
         },
         "webchat.session.rotateWhenBudgetRemainingBelow": {
           "type": "number",
-          "default": 0.15,
+          "default": 0.1,
           "minimum": 0.01,
           "maximum": 0.9,
           "description": "Start a fresh web chat when remaining session budget falls below this ratio."

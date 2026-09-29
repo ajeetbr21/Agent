@@ -26,6 +26,7 @@ const PROVIDER_URL_PATTERNS = [
 
 let creatingOffscreenDocument;
 let pendingPromptByTab = new Map();
+const lastTabAliveReport = new Map();
 
 chrome.runtime.onInstalled.addListener(async (details) => {
   void ensureBridge();
@@ -98,6 +99,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
   if (message?.type === "webchat.content.keepalive") {
     void ensureBridge();
+    reportTabAlive(sender.tab);
     return false;
   }
 
@@ -125,6 +127,11 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   }
 
   return false;
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  pendingPromptByTab.delete(tabId);
+  lastTabAliveReport.delete(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -250,13 +257,19 @@ async function forwardToActiveTab(message) {
 }
 
 async function dispatchPrompt(envelope) {
-  const shouldOpenFreshChat = envelope.payload.expectedAction === "rotate";
-  const tabs = shouldOpenFreshChat ? [] : await queryProviderTabs();
-  // Send to a tab of the provider the IDE targeted (matching host); open one if none is open.
-  const activeTab = pickTabForUrl(tabs, envelope.payload.chatUrl);
+  const tabs = await queryProviderTabs();
+  // Send to a tab of the provider the IDE targeted (matching host); open one only if none is open.
+  const target = pickTabForUrl(tabs, envelope.payload.chatUrl);
 
-  if (activeTab?.id) {
-    await sendPromptToTab(activeTab.id, envelope);
+  if (envelope.payload.expectedAction === "rotate") {
+    // A fresh chat. Reuse the provider's tab (navigate it to a new conversation) instead of piling
+    // up a new tab for every rotation.
+    if (target?.id) {
+      await startFreshChatInTab(target, envelope);
+      return;
+    }
+  } else if (target?.id) {
+    await sendPromptToTab(target.id, envelope);
     return;
   }
 
@@ -268,6 +281,64 @@ async function dispatchPrompt(envelope) {
   if (created.id) {
     pendingPromptByTab.set(created.id, envelope);
   }
+}
+
+async function startFreshChatInTab(tab, envelope) {
+  const chatUrl = envelope.payload.chatUrl;
+
+  // The prompt is sent by the onUpdated("complete") / content "ready" handlers once the new chat
+  // page has loaded. Some sites keep the same URL for an ongoing conversation, so a same-URL tab
+  // is reloaded rather than assumed to be a fresh chat.
+  pendingPromptByTab.set(tab.id, envelope);
+  if (sameUrl(tab.url, chatUrl)) {
+    await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+    await chrome.tabs.reload(tab.id);
+  } else {
+    await chrome.tabs.update(tab.id, { url: chatUrl, active: true });
+  }
+
+  // Safety net: if the navigation never produced a "complete" event, deliver once the tab is idle.
+  setTimeout(async () => {
+    if (pendingPromptByTab.get(tab.id) !== envelope) {
+      return;
+    }
+    const current = await chrome.tabs.get(tab.id).catch(() => undefined);
+    if (current?.status === "complete") {
+      void retryPendingPrompt(tab.id);
+    }
+  }, 5000);
+}
+
+function sameUrl(a, b) {
+  try {
+    const left = new URL(a);
+    const right = new URL(b);
+    const path = (url) => url.pathname.replace(/\/+$/, "") || "/";
+    return left.origin === right.origin && path(left) === path(right) && left.search === right.search;
+  } catch {
+    return false;
+  }
+}
+
+// Tell the IDE (at most every 10 s per tab) that this browser has a live provider tab, so prompts
+// are routed to this browser rather than another paired one.
+function reportTabAlive(tab) {
+  if (!tab?.id) {
+    return;
+  }
+  const now = Date.now();
+  if (now - (lastTabAliveReport.get(tab.id) || 0) < 10000) {
+    return;
+  }
+  lastTabAliveReport.set(tab.id, now);
+  void sendToBridge({
+    version: 1,
+    id: crypto.randomUUID(),
+    sessionId: SESSION_ID,
+    type: "bridge.status",
+    createdAt: new Date().toISOString(),
+    payload: { state: "tab-alive", tabId: tab.id, url: tab.url }
+  });
 }
 
 async function sendPromptToTab(tabId, envelope) {

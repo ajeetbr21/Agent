@@ -17,6 +17,8 @@ export interface BridgeServerOptions {
   readonly port: number;
   readonly token: string;
   readonly sessionId: string;
+  /** How long a message waits for a browser to (re)connect before it is dropped. Default 30 s. */
+  readonly pendingTtlMs?: number;
 }
 
 export interface BridgeClientInfo {
@@ -43,16 +45,35 @@ interface BridgeClient {
   readonly info: BridgeClientInfo;
   socket: net.Socket;
   buffer: Buffer;
+  /** Order of connection (newer = larger); last tie-breaker for which browser gets prompts. */
+  readonly connectedSeq: number;
+  /** Date.now() of the last chat.* message (prompt handled, reply streamed) from this browser. */
+  lastChatActivityAt: number;
+  /** Date.now() of the last sign that this browser has a live provider tab open. */
+  lastTabAliveAt: number;
+}
+
+interface PendingMessage {
+  readonly envelope: BridgeEnvelope;
+  readonly queuedAt: number;
 }
 
 const MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024;
 const CLIENT_PING_INTERVAL_MS = 5_000;
 const MAX_PENDING_BROWSER_MESSAGES = 20;
+const DEFAULT_PENDING_TTL_MS = 30_000;
+/** Sent to every connected browser; everything else goes to exactly one (see sendToBrowsers). */
+const BROADCAST_TYPES = new Set<BridgeEnvelope["type"]>(["providers.sync"]);
+/** Browser → IDE messages that mean "this browser is the one with the live chat tab". */
+const ACTIVITY_TYPES = new Set<BridgeEnvelope["type"]>(["chat.state", "chat.stream.delta", "chat.stream.done", "chat.error"]);
+/** A browser whose provider tab reported in within this window counts as "has a live chat tab". */
+const TAB_ALIVE_FRESH_MS = 30_000;
 
 export class LocalBridgeServer {
   private readonly events = new EventEmitter();
   private readonly clients = new Map<string, BridgeClient>();
-  private readonly pendingBrowserMessages: BridgeEnvelope[] = [];
+  private readonly pendingBrowserMessages: PendingMessage[] = [];
+  private connectionCounter = 0;
   private server: http.Server | undefined;
   private pingTimer: NodeJS.Timeout | undefined;
 
@@ -115,31 +136,66 @@ export class LocalBridgeServer {
     };
   }
 
+  /**
+   * Deliver an envelope to the browser. Prompts and page commands go to ONE browser (see
+   * clientsByPreference). Broadcasting them made every paired browser
+   * (e.g. the LeechCode-launched profile plus your normal Chrome) open its own tab and answer.
+   * Returns how many browsers received it (0 means it was queued briefly for a reconnect).
+   */
   sendToBrowsers(envelope: BridgeEnvelope): number {
     this.pruneDisconnectedClients();
 
     const text = JSON.stringify(envelope);
+    const targets = BROADCAST_TYPES.has(envelope.type)
+      ? [...this.clients.values()]
+      : this.clientsByPreference();
     let sent = 0;
 
-    for (const [clientId, client] of this.clients.entries()) {
-      if (!this.isClientConnected(client)) {
-        this.removeClient(clientId);
-        continue;
-      }
-
+    for (const client of targets) {
       try {
         client.socket.write(encodeTextFrame(text));
         sent += 1;
       } catch {
-        this.removeClient(clientId);
+        this.removeClient(client.info.id);
+        continue;
+      }
+      if (!BROADCAST_TYPES.has(envelope.type)) {
+        break; // exactly one browser handles a prompt/command
       }
     }
 
-    if (sent === 0) {
+    if (sent === 0 && !BROADCAST_TYPES.has(envelope.type)) {
+      // Broadcast types are re-sent on every pair, so only targeted messages need the queue.
       this.queueBrowserMessage(envelope);
     }
 
     return sent;
+  }
+
+  /** Id of the browser client that currently receives prompts (for tests / diagnostics). */
+  getPreferredClientId(): string | undefined {
+    this.pruneDisconnectedClients();
+    return this.clientsByPreference()[0]?.info.id;
+  }
+
+  /**
+   * Which browser should handle a prompt, best first:
+   * 1. browsers with a live provider tab (reported within TAB_ALIVE_FRESH_MS),
+   * 2. then the one that most recently handled a chat turn,
+   * 3. then the most recently connected.
+   * This keeps prompts in the browser the user is actually chatting in, and a browser that merely
+   * reconnected (e.g. after sleep) doesn't steal them.
+   */
+  private clientsByPreference(): BridgeClient[] {
+    const now = Date.now();
+    const fresh = (client: BridgeClient) => (now - client.lastTabAliveAt <= TAB_ALIVE_FRESH_MS ? 1 : 0);
+    return [...this.clients.values()]
+      .filter((client) => this.isClientConnected(client))
+      .sort((a, b) =>
+        fresh(b) - fresh(a) ||
+        b.lastChatActivityAt - a.lastChatActivityAt ||
+        b.connectedSeq - a.connectedSeq
+      );
   }
 
   private pruneDisconnectedClients(): void {
@@ -163,7 +219,7 @@ export class LocalBridgeServer {
   }
 
   private queueBrowserMessage(envelope: BridgeEnvelope): void {
-    this.pendingBrowserMessages.push(envelope);
+    this.pendingBrowserMessages.push({ envelope, queuedAt: Date.now() });
 
     if (this.pendingBrowserMessages.length > MAX_PENDING_BROWSER_MESSAGES) {
       this.pendingBrowserMessages.shift();
@@ -291,7 +347,10 @@ export class LocalBridgeServer {
         connectedAt: new Date().toISOString()
       },
       socket,
-      buffer: Buffer.alloc(0)
+      buffer: Buffer.alloc(0),
+      connectedSeq: ++this.connectionCounter,
+      lastChatActivityAt: 0,
+      lastTabAliveAt: 0
     };
 
     this.clients.set(clientId, client);
@@ -323,13 +382,17 @@ export class LocalBridgeServer {
       return;
     }
 
-    const pending = this.pendingBrowserMessages.splice(0);
+    // Only replay what is still fresh: a prompt the user gave up on minutes ago (and got on the
+    // clipboard instead) must not suddenly be typed into a chat when a browser shows up later.
+    const ttl = this.options.pendingTtlMs ?? DEFAULT_PENDING_TTL_MS;
+    const cutoff = Date.now() - ttl;
+    const pending = this.pendingBrowserMessages.splice(0).filter((item) => item.queuedAt >= cutoff);
 
-    for (const envelope of pending) {
+    for (const item of pending) {
       try {
-        client.socket.write(encodeTextFrame(JSON.stringify(envelope)));
+        client.socket.write(encodeTextFrame(JSON.stringify(item.envelope)));
       } catch {
-        this.queueBrowserMessage(envelope);
+        this.pendingBrowserMessages.push(item);
         this.removeClient(client.info.id);
         return;
       }
@@ -346,7 +409,14 @@ export class LocalBridgeServer {
       }
 
       for (const message of decoded.messages) {
-        this.events.emit("message", JSON.parse(message) as BridgeEnvelope);
+        const envelope = JSON.parse(message) as BridgeEnvelope;
+        if (ACTIVITY_TYPES.has(envelope.type)) {
+          client.lastChatActivityAt = Date.now();
+          client.lastTabAliveAt = client.lastChatActivityAt;
+        } else if (envelope.type === "bridge.status" && isTabAlive(envelope.payload)) {
+          client.lastTabAliveAt = Date.now();
+        }
+        this.events.emit("message", envelope);
       }
 
       if (decoded.closeRequested) {
@@ -356,6 +426,10 @@ export class LocalBridgeServer {
       this.removeClient(client.info.id);
     }
   }
+}
+
+function isTabAlive(payload: unknown): boolean {
+  return isRecord(payload) && payload.state === "tab-alive";
 }
 
 function readHeader(request: http.IncomingMessage, name: string): string | undefined {

@@ -59,7 +59,7 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
         <NumberField
           label={`Max conversation length for ${settings.currentProviderLabel || "this provider"} (chars)`}
-          hint="Total characters WebChat will deliver into one chat — caps how much of a whole-codebase index is sent so it doesn't overflow the session window. Set per provider."
+          hint="This chat's conversation window. LeechCode starts a fresh chat when ~90% of it is used, and caps a whole-codebase index to it. Set per provider."
           value={settings.sessionLimit}
           min={4000}
           step={10000}
@@ -95,7 +95,7 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
         <NumberField
           label="Max context tokens"
-          hint="Approximate total window for one chat session."
+          hint="Upper bound for one chat session; each provider's “Max conversation length” (above) caps it further."
           value={settings.maxContextTokens}
           min={1000}
           step={1000}
@@ -117,7 +117,7 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
         <NumberField
           label="Compact every N prompts"
-          hint="Ask the model to summarize durable state on this cadence."
+          hint="On this cadence the model also writes a thorough state summary — your prompt is still sent."
           value={settings.compactEveryPrompts}
           min={1}
           step={1}
@@ -125,7 +125,7 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
         <NumberField
           label="Rotate when remaining below"
-          hint="Start a fresh chat when this fraction of budget is left (e.g. 0.15 = 15%)."
+          hint="Start a fresh chat (in the same tab) when this fraction of budget is left (e.g. 0.1 = 10%)."
           value={settings.rotateWhenBudgetRemainingBelow}
           min={0.01}
           max={0.9}

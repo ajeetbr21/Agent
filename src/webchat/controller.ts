@@ -51,9 +51,12 @@ import type { PromptFile } from "../prompt/types";
 import {
   applyPromptUsage,
   applyResponseUsage,
+  capBudgetToWindow,
+  CHARS_PER_TOKEN,
   decideNextSessionAction,
   defaultSessionPolicy,
   estimateTokens,
+  startFreshSession,
   type SessionPolicy,
   type SessionUsage
 } from "../session/policy";
@@ -81,6 +84,9 @@ const DEFAULT_MAX_INDEX_CHUNKS = 80;
 const MAX_INDEX_CHUNK_RETRIES = 2;
 
 const BRIDGE_TOKEN_SECRET_KEY = "webchat.bridge.pairingToken";
+
+const COMPACT_ALONGSIDE_TASK_NOTE =
+  "Session upkeep for this turn: do the user task above fully as usual, AND make the `summary` field a thorough compacted development state (objective, current status, decisions, files changed, next actions, known errors) so a fresh chat could continue from it.";
 
 const SETTING_PATHS: Record<string, string> = {
   defaultProvider: "defaultProvider",
@@ -456,9 +462,15 @@ export class WebChatController implements vscode.Disposable {
       // the normal single-message path (which truncates to fit / copies to clipboard as before).
     }
 
+    // Compact/rotate are decided only on fresh user turns. Tool results, subagent tasks and repairs
+    // must land in the SAME chat that asked for them — rotating there opened a new tab and sent the
+    // tool output to a conversation that never saw the request.
+    const sessionAction = forcedAction ?? (resetToolLoop ? undefined : "continue");
     // Include the project tree on fresh user turns; skip on tool-loop continuations (already in context).
-    const { prompt, action } = await this.buildProviderPrompt(provider, instruction, forcedAction, contextPaths, resetToolLoop);
-    this.usage = applyPromptUsage(this.usage, prompt);
+    const { prompt, action } = await this.buildProviderPrompt(provider, instruction, sessionAction, contextPaths, resetToolLoop);
+    // A rotate starts a new conversation, so its budget starts over. (Without this reset every later
+    // prompt was also "rotate" — a new browser tab for every single message.)
+    this.usage = action === "rotate" ? startFreshSession(prompt) : applyPromptUsage(this.usage, prompt);
     const providerLimit = this.getProviderMessageLimit(provider.id);
     if (prompt.length > providerLimit) {
       this.emitters.notice.fire({
@@ -502,7 +514,7 @@ export class WebChatController implements vscode.Disposable {
       await vscode.env.clipboard.writeText(prompt);
       this.emitters.notice.fire({
         level: "warn",
-        message: "No browser is connected — the prompt was copied to your clipboard instead."
+        message: "No browser is connected — the prompt was copied to your clipboard. It is still delivered if the browser reconnects within 30 seconds."
       });
     }
 
@@ -627,7 +639,8 @@ export class WebChatController implements vscode.Disposable {
 
     if (message.type === "chat.stream.delta" && isDelta(message.payload)) {
       this.activeAssistantText = message.payload.fullText || `${this.activeAssistantText}${message.payload.text}`;
-      this.usage = applyResponseUsage(this.usage, message.payload.text);
+      // Usage is counted once, on done: a streaming page often re-renders earlier text, and then the
+      // "delta" is the whole reply again — summing deltas inflated output usage many times over.
       this.emitters.streamDelta.fire({
         turnId: this.currentTurnId,
         text: message.payload.text,
@@ -639,6 +652,7 @@ export class WebChatController implements vscode.Disposable {
 
     if (message.type === "chat.stream.done" && isDone(message.payload)) {
       this.activeAssistantText = message.payload.fullText || this.activeAssistantText;
+      this.usage = applyResponseUsage(this.usage, this.activeAssistantText);
       this.emitters.usage.fire(this.getUsageInfo());
       void this.handleAssistantDone(this.activeAssistantText, message.payload.providerId);
     }
@@ -1880,7 +1894,7 @@ export class WebChatController implements vscode.Disposable {
   }
 
   getUsageInfo(): SessionUsageInfo {
-    const policy = this.getSessionPolicy();
+    const policy = this.getSessionPolicy(this.getCurrentProvider()?.id);
     const total = this.usage.inputTokensUsed + this.usage.outputTokensUsed;
     return {
       promptCount: this.usage.promptCount,
@@ -1937,7 +1951,7 @@ export class WebChatController implements vscode.Disposable {
         message: `Trimmed ${dropped} context file${dropped === 1 ? "" : "s"} to fit ${provider.label}'s ${providerLimit.toLocaleString()}-char message limit. Attach fewer files or raise the limit in Settings.`
       })
     );
-    const policy = this.getSessionPolicy();
+    const policy = this.getSessionPolicy(provider.id);
     const decided = forcedAction || decideNextSessionAction(this.usage, policy);
     const storedSummary = this.getStoredSummary();
     const agentInstructions = buildAgentToolInstructions({
@@ -1953,16 +1967,20 @@ export class WebChatController implements vscode.Disposable {
     const taskInstruction = userInstruction
       ? `User task:\n${userInstruction}`
       : "Use the following editor context to help with the user's coding task.";
+    // A scheduled compaction must never swallow what the user just asked: keep the task and ask for
+    // a thorough summary alongside it. Only a manual "compact now" (no task) is a pure compaction turn.
+    const pureCompaction = decided === "compact" && !userInstruction;
     const basePrompt = buildPrompt({
       provider,
-      instruction:
-        decided === "compact"
-          ? ["Before continuing, compact the current development state so it can seed a fresh chat later.", agentInstructions].join("\n\n")
+      instruction: pureCompaction
+        ? ["Before continuing, compact the current development state so it can seed a fresh chat later.", agentInstructions].join("\n\n")
+        : decided === "compact"
+          ? [taskInstruction, COMPACT_ALONGSIDE_TASK_NOTE, agentInstructions].join("\n\n")
           : [taskInstruction, agentInstructions].join("\n\n"),
       files
     });
     const finalPrompt =
-      decided === "compact"
+      pureCompaction
         ? `${basePrompt}\n\n${buildCompactionPrompt({ recentAssistantText: "", files })}`
         : decided === "rotate" && storedSummary
           ? `${basePrompt}\n\nContinue from this compacted state:\n${storedSummary}`
@@ -2058,11 +2076,18 @@ export class WebChatController implements vscode.Disposable {
     this.emitters.context.fire(this.getContextInfo());
   }
 
-  private getSessionPolicy(): SessionPolicy {
+  /**
+   * Session policy for a provider: the configured budget, capped to that provider's conversation
+   * window ("Max conversation length") so a fresh chat starts before the provider cuts it off.
+   */
+  private getSessionPolicy(providerId?: string): SessionPolicy {
     const config = vscode.workspace.getConfiguration("webchat");
+    const windowTokens = providerId
+      ? Math.floor(this.getProviderSessionLimit(providerId) / CHARS_PER_TOKEN)
+      : undefined;
     return {
       compactEveryPrompts: config.get("session.compactEveryPrompts", defaultSessionPolicy.compactEveryPrompts),
-      budget: {
+      budget: capBudgetToWindow({
         maxContextTokens: config.get("session.maxContextTokens", defaultSessionPolicy.budget.maxContextTokens),
         maxInputTokens: config.get("session.maxInputTokens", defaultSessionPolicy.budget.maxInputTokens),
         maxOutputTokens: config.get("session.maxOutputTokens", defaultSessionPolicy.budget.maxOutputTokens),
@@ -2070,7 +2095,7 @@ export class WebChatController implements vscode.Disposable {
           "session.rotateWhenBudgetRemainingBelow",
           defaultSessionPolicy.budget.rotateWhenBudgetRemainingBelow
         )
-      }
+      }, windowTokens)
     };
   }
 

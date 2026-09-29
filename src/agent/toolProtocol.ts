@@ -100,7 +100,7 @@ export function buildAgentToolInstructions(input: {
     `Configured total context limit: ${input.maxContextTokens} approximate tokens.`,
     `Compaction cadence: every ${input.compactEveryPrompts} prompts.`,
     input.action === "compact"
-      ? "This turn must compact the current development state in summary and include no file edits unless essential."
+      ? "This turn also compacts the session: make summary a thorough compacted development state. If the user gave a task, still complete it (file edits and tools are allowed)."
       : "",
     input.action === "rotate"
       ? "This turn is for a fresh chat session. Start from the previous summary, then continue the work."
