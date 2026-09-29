@@ -16,7 +16,8 @@ export type BridgeMessageType =
   | "chat.stream.delta"
   | "chat.stream.done"
   | "chat.state"
-  | "chat.error";
+  | "chat.error"
+  | "providers.sync";
 
 export interface BridgeEnvelope<TPayload = unknown> {
   readonly version: typeof PROTOCOL_VERSION;
@@ -76,6 +77,23 @@ export interface ChatNavigatePayload {
   readonly url: string;
 }
 
+/**
+ * IDE → browser: the full list of user-defined AI sites. The browser stores it, asks the user for
+ * host access where needed, and registers its content script on those sites.
+ */
+export interface ProvidersSyncPayload {
+  readonly customProviders: readonly {
+    readonly id: string;
+    readonly label: string;
+    readonly chatUrl: string;
+    readonly host: string;
+    readonly matchPattern: string;
+    readonly inputSelectors: readonly string[];
+    readonly submitSelectors: readonly string[];
+    readonly assistantSelectors: readonly string[];
+  }[];
+}
+
 /** User-editable CSS-selector overrides for one provider's page (tried before the built-ins). */
 export interface ProviderSelectorOverride {
   readonly inputSelectors?: readonly string[];
@@ -124,7 +142,11 @@ export interface ChatStatePayload {
     | "ready"
     | "login-required"
     | "prompt-inserted"
+    /** Still working on inserting/sending — the provider has NOT received the prompt yet. */
     | "submitting"
+    /** The send control was actually activated: the provider may now be generating. */
+    | "submitted"
+    | "cancelled"
     | "streaming"
     | "waiting-response"
     | "complete"

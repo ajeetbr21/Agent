@@ -59,7 +59,7 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
         <NumberField
           label={`Max conversation length for ${settings.currentProviderLabel || "this provider"} (chars)`}
-          hint="Total characters WebChat will deliver into one chat — caps how much of a whole-codebase index is sent so it doesn't overflow the session window. Set per provider."
+          hint="This chat's conversation window. LeechCode starts a fresh chat when ~90% of it is used, and caps a whole-codebase index to it. Set per provider."
           value={settings.sessionLimit}
           min={4000}
           step={10000}
@@ -79,6 +79,13 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
       </Section>
 
+      <Section
+        title="Custom AI sites"
+        hint="Use any web AI chat, not just the built-ins. Add its chat page URL here, then allow it once in the browser extension's options page."
+      >
+        <CustomProviderEditor providers={providers} />
+      </Section>
+
       <Section title="Context window & budget" hint="Customize the token window before WebChat compacts or starts a fresh chat.">
         <ToggleField
           label="Chunk large codebase index"
@@ -88,7 +95,7 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
         <NumberField
           label="Max context tokens"
-          hint="Approximate total window for one chat session."
+          hint="Upper bound for one chat session; each provider's “Max conversation length” (above) caps it further."
           value={settings.maxContextTokens}
           min={1000}
           step={1000}
@@ -110,7 +117,7 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
         <NumberField
           label="Compact every N prompts"
-          hint="Ask the model to summarize durable state on this cadence."
+          hint="On this cadence the model also writes a thorough state summary — your prompt is still sent."
           value={settings.compactEveryPrompts}
           min={1}
           step={1}
@@ -118,7 +125,7 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
         />
         <NumberField
           label="Rotate when remaining below"
-          hint="Start a fresh chat when this fraction of budget is left (e.g. 0.15 = 15%)."
+          hint="Start a fresh chat (in the same tab) when this fraction of budget is left (e.g. 0.1 = 10%)."
           value={settings.rotateWhenBudgetRemainingBelow}
           min={0.01}
           max={0.9}
@@ -143,6 +150,50 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
           hint="Ask the chat once for a corrected tool block when JSON is malformed."
           checked={settings.autoRepair}
           onChange={(value) => update("autoRepair", value)}
+        />
+        <SelectField
+          label="Agent mode"
+          hint="Full access applies edits and runs commands with no approvals — every change can still be undone (/undo). Saved in your user settings, never per repository."
+          value={settings.agentMode}
+          options={[
+            { value: "ask", label: "Ask — review edits and commands" },
+            { value: "auto", label: "Auto-edit — apply edits, approve commands" },
+            { value: "plan", label: "Plan — no edits, no commands" },
+            { value: "bypass", label: "Full access — no approvals" }
+          ]}
+          onChange={(value) => update("agentMode", value)}
+        />
+        <NumberField
+          label="Max tool rounds per task"
+          hint="How many read → edit → run cycles the agent may do before pausing. 0 = default (6, or 25 in full access)."
+          value={settings.maxToolIterations}
+          min={0}
+          max={200}
+          step={1}
+          onChange={(value) => update("maxToolIterations", value)}
+        />
+        <ToggleField
+          label="Never send credentials"
+          hint="Skip files that hold secrets (.env, keys, certificates, credentials) and mask credential-looking values in everything sent — prompts, file context, command output, git diffs. Leave this on: a web chat is a third party."
+          checked={settings.redactSecrets}
+          onChange={(value) => update("redactSecrets", value)}
+        />
+        <SelectField
+          label="If a request fails in the browser"
+          hint="LeechCode can hand the task to another provider using a handover it builds locally (objective, files already changed, tool output). It never replays a request the provider may already have acted on without asking."
+          value={settings.failoverMode}
+          options={[
+            { value: "off", label: "Just tell me (retry or switch myself)" },
+            { value: "safe", label: "Switch provider when nothing was sent yet" },
+            { value: "always", label: "Also offer to switch after an unclear failure" }
+          ]}
+          onChange={(value) => update("failoverMode", value)}
+        />
+        <ToggleField
+          label="Confirm dangerous commands in full access"
+          hint="Still ask before commands that could wipe data: deleting a drive/home folder, formatting disks, force-push, git reset --hard, curl | sh, sudo, shutdown."
+          checked={settings.confirmDangerousCommands}
+          onChange={(value) => update("confirmDangerousCommands", value)}
         />
       </Section>
 
@@ -187,13 +238,95 @@ export function SettingsView({ settings, providers, bridge, onBack }: SettingsVi
           step={1}
           onChange={(value) => update("bridgePort", value)}
         />
-        <TextField
-          label="Token"
-          hint="Shared secret. Keep the browser extension token identical."
-          value={settings.bridgeToken}
-          onChange={(value) => update("bridgeToken", value)}
-        />
+        <div className="field">
+          <span className="field-label">Pairing token</span>
+          <span className="field-hint">
+            {settings.bridgeTokenCustom
+              ? "Using the custom webchat.bridge.token user setting."
+              : "A private random token stored in your OS keychain."}{" "}
+            Paste it into the WebChat Bridge browser extension (click its toolbar icon). It is never shown here or written to settings.json.
+          </span>
+          <div className="bridge-token-actions">
+            <button className="btn ghost" onClick={() => post({ type: "copyBridgeToken" })}>
+              Copy pairing token
+            </button>
+            <button
+              className="btn ghost"
+              title="Disconnects every paired browser until the new token is pasted into it"
+              onClick={() => post({ type: "regenerateBridgeToken" })}
+            >
+              Regenerate
+            </button>
+          </div>
+        </div>
       </Section>
+    </div>
+  );
+}
+
+/** List, add and remove user-defined AI sites (persisted to webchat.customProviders). */
+function CustomProviderEditor({ providers }: { providers: readonly ProviderInfo[] }) {
+  const [label, setLabel] = useState("");
+  const [url, setUrl] = useState("");
+  const custom = providers.filter((provider) => provider.custom);
+  const canAdd = label.trim().length > 0 && /^https?:\/\/\S+$/i.test(url.trim());
+
+  const add = () => {
+    if (!canAdd) {
+      return;
+    }
+    post({ type: "addCustomProvider", label: label.trim(), url: url.trim() });
+    setLabel("");
+    setUrl("");
+  };
+
+  return (
+    <div className="field">
+      <div className="custom-provider-list">
+        {custom.map((provider) => (
+          <div className="custom-provider-row" key={provider.id}>
+            <span className="custom-provider-name">{provider.label}</span>
+            <span className="custom-provider-url">{provider.chatUrl ?? provider.host}</span>
+            <button
+              className="attach-remove"
+              title={`Remove ${provider.label}`}
+              onClick={() => post({ type: "removeCustomProvider", id: provider.id })}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+        {custom.length === 0 ? <span className="session-empty">no custom sites yet</span> : null}
+      </div>
+      <div className="model-add-row">
+        <input
+          type="text"
+          className="field-input"
+          placeholder="Name, e.g. Z.ai"
+          value={label}
+          onChange={(event) => setLabel(event.target.value)}
+        />
+        <input
+          type="text"
+          className="field-input"
+          placeholder="https://chat.z.ai/"
+          value={url}
+          onChange={(event) => setUrl(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              add();
+            }
+          }}
+        />
+        <button className="btn ghost" disabled={!canAdd} onClick={add}>
+          Add
+        </button>
+      </div>
+      <span className="field-hint">
+        The extension guesses the message box, Send button and reply area. If it guesses wrong on a site, right-click
+        the right element on that page → WebChat Bridge → “Use as chat input / Send button / reply”.
+      </span>
     </div>
   );
 }

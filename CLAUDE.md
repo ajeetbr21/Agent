@@ -60,6 +60,14 @@ workspace mutation lives in the IDE extension behind path-safety checks and appr
 | [src/bridge/webSocketCodec.ts](src/bridge/webSocketCodec.ts) | RFC6455 frame encode/decode (text/ping/pong/close, masking both directions, length variants). No external deps. |
 | [src/agent/toolProtocol.ts](src/agent/toolProtocol.ts) | The agent "tool" contract. Builds the instruction block (requires **streamed prose before the JSON block**, advertises the tool suite), parses the `<webchat_agent_response>` marked JSON (base64 file writes preferred; `tools` array of `read_file`/`list_dir`/`search`/`run`/`spawn_subagent`, legacy `commands` folded into `run`), builds the repair prompt. |
 | [src/agent/tools.ts](src/agent/tools.ts) | Executes the read-only tools (`read_file`/`list_dir`/`search`) safely — workspace-scoped via `resolveWorkspacePath`, size/entry/match-capped. `run` (shell) + `spawn_subagent` live in the controller. |
+| [src/agent/vscodeContext.ts](src/agent/vscodeContext.ts) | VS Code context tools/mentions: `diagnostics` (Problems panel), `open_editors`, `git_status`/`git_diff` (read-only `git` via execFile), `symbols` (workspace symbol provider), `references` (definition + reference providers). Formatting lives in the pure `contextFormat.ts`. |
+| [src/agent/fileEdits.ts](src/agent/fileEdits.ts) | Pure find/replace engine for the `edit` file action (unique match or `all`, CRLF-preserving, trailing-whitespace tolerant). `workspace/applyAgentChanges.ts` validates every change of a response before writing any, records sha256 "after" hashes, and reverts from snapshots for undo. |
+| [src/workspace/gitWorkflow.ts](src/workspace/gitWorkflow.ts) | Optional git safety net: task branch, per-turn commit of only the agent's paths, `taskCommits`/`revertCommits` via the `LeechCode-Task:` trailer, and `taskDiff` for reviews. Naming/parsing helpers are in the vscode-free `gitNaming.ts`; all git runs through the hardened `gitCli.ts`. |
+| [src/agent/reviewPrompt.ts](src/agent/reviewPrompt.ts) | Pure builders for the second-opinion flow: `buildReviewPrompt` (review-only, verdict in `summary`, findings in `nextSteps`), `readReviewOutcome`, `buildFixPrompt`. The controller sets `reviewContext` so a reviewer's reply is surfaced, never applied. |
+| [src/prompt/redact.ts](src/prompt/redact.ts) | Pure credential guard. `isSecretFile`/`SECRET_FILE_GLOBS` keep credential files out of every read path; `redactSecrets` masks token shapes and secret-looking assignment values. Applied to file reads (tools.ts, controller context), git diffs (vscodeContext.ts) and — as the final choke point — `WebChatController.protectOutgoing()` on every `chat.prompt` payload. |
+| [src/webchat/taskState.ts](src/webchat/taskState.ts) | Pure request lifecycle (`reduceRequest`) + provider health/cooldown. `submitted` from the content script is the acceptance point: before it a failure is `failed_before_accept` (safe to retry on another provider), after it `ambiguous` (never replayed automatically). |
+| [src/webchat/continuation.ts](src/webchat/continuation.ts) | Pure builder for the handover prompt sent to a new provider (a provider's own history can't be moved): objective, already-changed files, tool output, errors, permissions, checkpoint. |
+| [src/agent/commandSafety.ts](src/agent/commandSafety.ts) | Pure `dangerousCommandReason()` — the only gate on full-access (`bypass`) shell commands: flags data-destroying commands so they still need confirmation (`agent.confirmDangerousCommands`). |
 | [src/prompt/buildPrompt.ts](src/prompt/buildPrompt.ts) | Provider-neutral `<webchat_request>` XML prompt (CDATA-wrapped file blocks, escaped meta). Exports `wrapCdata`/`escapeXml` for reuse by the chunker. |
 | [src/prompt/indexChunker.ts](src/prompt/indexChunker.ts) | Pure `planIndexChunks()` — splits a whole-codebase index into ordered, paste-safe `<webchat_codebase_index part="i" of="N">` messages under the provider's per-message char limit; large files split across messages with `part="k/n"` continuation markers; honors a session (conversation) char cap + a max-chunk cap. `splitContent` (lossless), `buildIndexPrimedNote`. |
 | [src/prompt/compaction.ts](src/prompt/compaction.ts) | `<webchat_compaction_request>` prompt — asks the model for durable state (objective, status, decisions, files, constraints, next actions, known errors). |
@@ -156,8 +164,12 @@ Settings namespace `webchat.*`: `defaultProvider`, `prompt.includeSelectionOnly`
 budget knobs, `context.maxIndexChars` (single-message paste budget), `provider.maxMessageChars` +
 `provider.maxSessionChars` (per-provider override maps for the per-message and per-conversation char
 windows), and `index.chunked` / `index.maxChunks` (chunked whole-codebase indexing).
-⚠ `bridge.port` (53451) and `bridge.token` ("webchat-dev-token") are **hard-coded** in
-`browser-extension/src/offscreen.js` — change both sides together.
+Bridge pairing: the token is a random per-install secret generated on first start and kept in
+VS Code SecretStorage (`webchat.bridge.pairingToken`), resolved by `src/bridge/pairing.ts`
+(`webchat.bridge.token` is an optional application-scope override ≥ 24 chars; the legacy
+"webchat-dev-token" is always rejected). The browser side stores port + token in
+`chrome.storage.local` via `browser-extension/options.html`; `background.js` pushes them to the
+offscreen socket. The server compares tokens in constant time and refuses non-extension `Origin`s.
 
 ---
 

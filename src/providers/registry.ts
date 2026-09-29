@@ -1,13 +1,17 @@
 import type { ProviderId, WebChatProvider } from "./types";
+import { parseCustomProviders, type CustomProviderAdapter } from "./custom";
 
-const providers: readonly WebChatProvider[] = [
+// maxSessionChars is each chat's conversation window: LeechCode starts a fresh chat when ~90% of it
+// is used (estimated at 4 chars/token). Claude and DeepSeek hard-stop long chats, so they stay
+// below their real limits; ChatGPT/Gemini/AI Studio/Qwen truncate or have very large windows.
+const builtInProviders: readonly WebChatProvider[] = [
   {
     id: "chatgpt",
     label: "ChatGPT",
     host: "chatgpt.com",
     chatUrl: "https://chatgpt.com/",
     maxMessageChars: 12000,
-    maxSessionChars: 240000,
+    maxSessionChars: 800000,
     tags: ["chat", "vision"],
     imageSupport: "limited",
     models: ["Auto", "Instant", "Thinking"],
@@ -30,7 +34,7 @@ const providers: readonly WebChatProvider[] = [
     host: "gemini.google.com",
     chatUrl: "https://gemini.google.com/app",
     maxMessageChars: 12000,
-    maxSessionChars: 500000,
+    maxSessionChars: 3000000,
     tags: ["chat", "vision"],
     imageSupport: "generous",
     models: ["3 Flash", "3 Pro"]
@@ -41,7 +45,7 @@ const providers: readonly WebChatProvider[] = [
     host: "chat.qwen.ai",
     chatUrl: "https://chat.qwen.ai/",
     maxMessageChars: 8000,
-    maxSessionChars: 120000,
+    maxSessionChars: 600000,
     tags: ["chat", "vision"],
     imageSupport: "generous",
     models: ["Qwen3-Max", "Qwen3-Coder", "Qwen3-VL"]
@@ -52,7 +56,7 @@ const providers: readonly WebChatProvider[] = [
     host: "chat.deepseek.com",
     chatUrl: "https://chat.deepseek.com/",
     maxMessageChars: 12000,
-    maxSessionChars: 200000,
+    maxSessionChars: 400000,
     tags: ["chat"],
     imageSupport: "none",
     models: ["DeepSeek", "DeepThink"],
@@ -85,10 +89,38 @@ const providers: readonly WebChatProvider[] = [
   }
 ];
 
+let customProviders: readonly WebChatProvider[] = [];
+let customAdapters: readonly CustomProviderAdapter[] = [];
+
+/**
+ * Replace the user-defined providers (from `webchat.customProviders`). Returns validation errors
+ * for entries that were skipped.
+ */
+export function setCustomProviders(raw: unknown): readonly string[] {
+  const result = parseCustomProviders(
+    raw,
+    new Set(builtInProviders.map((provider) => provider.id)),
+    new Set(builtInProviders.map((provider) => provider.host))
+  );
+  customProviders = result.providers;
+  customAdapters = result.adapters;
+  return result.errors;
+}
+
+export function listCustomAdapters(): readonly CustomProviderAdapter[] {
+  return customAdapters;
+}
+
 export function listProviders(): readonly WebChatProvider[] {
-  return providers;
+  return [...builtInProviders, ...customProviders];
 }
 
 export function getProvider(id: ProviderId | string): WebChatProvider | undefined {
-  return providers.find((provider) => provider.id === id);
+  return listProviders().find((provider) => provider.id === id);
+}
+
+/** Find the provider (built-in or custom) that owns a hostname, including subdomains. */
+export function findProviderByHost(hostname: string): WebChatProvider | undefined {
+  const host = hostname.toLowerCase();
+  return listProviders().find((provider) => host === provider.host || host.endsWith(`.${provider.host}`));
 }

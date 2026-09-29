@@ -266,6 +266,9 @@ body {
 .change-status.applied {
   color: var(--vscode-testing-iconPassed, #3fb950);
 }
+.change-status.reverted {
+  color: var(--wc-muted);
+}
 .change-status.error {
   color: var(--vscode-testing-iconFailed, #f85149);
 }
@@ -302,6 +305,10 @@ body {
 .badge.delete {
   background: rgba(248, 81, 73, 0.18);
   color: var(--vscode-testing-iconFailed, #f85149);
+}
+.badge.edit {
+  background: rgba(56, 139, 253, 0.18);
+  color: var(--vscode-textLink-foreground, #388bfd);
 }
 .change-actions {
   display: flex;
@@ -620,6 +627,11 @@ body {
   gap: 8px;
   font-size: 12px;
   margin-bottom: 4px;
+}
+.bridge-token-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 /* ============================================================================
@@ -1069,4 +1081,44 @@ body {
 .model-add-row .field-input {
   flex: 1;
   min-width: 0;
+}
+
+/* Custom AI sites (Settings) */
+.custom-provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.custom-provider-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.custom-provider-name {
+  font-weight: 500;
+}
+.custom-provider-url {
+  flex: 1;
+  color: var(--wc-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Second-opinion review card */
+.review-summary {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.review-findings {
+  margin: 0 0 8px;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.45;
 }

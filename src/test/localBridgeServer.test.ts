@@ -57,17 +57,25 @@ test("LocalBridgeServer returns HTTP health without a browser client", async (t)
   t.after(() => server.dispose());
 
   const response = await fetch(`http://127.0.0.1:${port}/health`);
-  const status = await response.json() as {
-    running: boolean;
-    port: number;
-    browserClients: unknown[];
-  };
+  const status = await response.json();
 
+  // Without the token /health reveals only liveness, never client details.
   assert.equal(response.status, 200);
   assert.deepEqual(status, {
     running: true,
     port,
-    browserClients: []
+    clientCount: 0,
+    authenticated: false
+  });
+
+  const authed = await fetch(`http://127.0.0.1:${port}/health`, {
+    headers: { "x-webchat-token": "test-token" }
+  });
+  assert.deepEqual(await authed.json(), {
+    running: true,
+    port,
+    browserClients: [],
+    authenticated: true
   });
 });
 

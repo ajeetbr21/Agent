@@ -62,18 +62,20 @@ Then **reload the window** (command palette → *Developer: Reload Window*). You
 3. Click **Load unpacked**.
 4. Select the `browser-extension/` folder inside the cloned repo.
 
-The **WebChat Bridge** card appears. It immediately starts trying to connect to the IDE's bridge on `ws://127.0.0.1:53451` (and reconnects automatically every few seconds).
+The **WebChat Bridge** card appears and its options page opens. The extension won't connect until it is paired with the editor (next step). You can reopen the options page any time by clicking the extension's toolbar icon.
 
 > Updating later: after pulling changes that touch `browser-extension/`, hit the ↻ reload icon on the extension card, then refresh any open chat tabs.
 
 ## 4. First connection
 
-1. In the editor, open the **LeechCode** panel. The bridge starts automatically (status strip at the top).
-2. In the extension-loaded browser, open your chat provider — e.g. `https://chatgpt.com/` — **or** click **open chat tab** in the panel, which launches a browser with the extension and the right URL for the selected provider.
-3. Log in to the provider once. The session sticks to that browser profile.
-4. Watch the status strip: the dot goes green and reads **`1 browser connected`**. A notice appears: *"Browser connected — 1 chat tab ready."*
+1. In the editor, open the **LeechCode** panel. The bridge starts automatically (status strip at the top). On the very first start the editor generates a random pairing token and stores it in the OS keychain (VS Code SecretStorage) — it is never written to `settings.json`.
+2. Copy it: click **Copy pairing token** on the toast, run **LeechCode: Copy Bridge Pairing Token**, or use ⚙ Settings → Bridge → **Copy pairing token**.
+3. In the browser, open the WebChat Bridge options page (toolbar icon), paste the token, keep port `53451` unless you changed `webchat.bridge.port`, and click **Save & connect**. The status box turns green: *Connected to the IDE bridge*.
+4. In the extension-loaded browser, open your chat provider — e.g. `https://chatgpt.com/` — **or** click **open chat tab** in the panel, which launches a browser with the extension and the right URL for the selected provider.
+5. Log in to the provider once. The session sticks to that browser profile.
+6. Watch the status strip: the dot goes green and reads **`1 browser connected`**. A notice appears: *"Browser connected — 1 chat tab ready."*
 
-Quick sanity check without the panel: `curl "http://127.0.0.1:53451/health"` should report `"running":true` and one browser client.
+Quick sanity check without the panel: `curl "http://127.0.0.1:53451/health"` should report `"running":true` and `"clientCount":1`. Client details are only returned with the token: `curl -H "x-webchat-token: $TOKEN" http://127.0.0.1:53451/health`.
 
 ## 5. First task
 
@@ -87,13 +89,14 @@ Quick sanity check without the panel: `curl "http://127.0.0.1:53451/health"` sho
 
 | Symptom | Fix |
 | --- | --- |
-| Status strip says **Bridge offline** | Run the command **LeechCode: Start Browser Bridge**; check nothing else is on port 53451 (`lsof -i :53451`). Change `webchat.bridge.port` *and* `BRIDGE_PORT` in `browser-extension/src/offscreen.js` together if you must move it. |
+| Status strip says **Bridge offline** | Run the command **LeechCode: Start Browser Bridge**; check nothing else is on port 53451 (`lsof -i :53451`). If you must move it, change `webchat.bridge.port` and the port on the extension's options page. |
 | **Bridge up · no browser** | The browser extension isn't loaded/connected: reload the extension card, make sure a supported chat site tab is open, and that you didn't load the extension into a different browser than the one you're using. |
 | Prompt is typed but never sent | Enable `webchat.browser.autoSubmit`, or the page changed its send-button markup — see [provider-adapters.md](provider-adapters.md). |
 | Reply never streams into the panel | The page changed its reply container selectors — see [provider-adapters.md](provider-adapters.md) (`assistantSelectors`). |
 | A login/upsell pop-up blocks everything | LeechCode auto-dismisses the common ones and retries; hard login walls need one manual login in that browser. |
 | "message too long" style errors from the provider | Lower the per-message limit for that provider in ⚙ Settings (per-provider **Max message length**). |
-| Port/token mismatch after changing settings | `bridge.port`/`bridge.token` are mirrored in `browser-extension/src/offscreen.js`; edit both, reload extension + window. |
+| Options page says **Token rejected by the IDE** | The pasted token is stale (e.g. after **Regenerate Bridge Pairing Token**, or a strong `webchat.bridge.token` override is set). Copy it again from the editor and paste it. |
+| Options page says **IDE bridge not reachable** | The editor isn't running LeechCode, or the ports differ — compare `webchat.bridge.port` with the options page. |
 
 ## Uninstall
 

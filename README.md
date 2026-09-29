@@ -80,9 +80,10 @@ This installs into your **existing editor** (current profile) — it does **not*
 ### 4. Connect and go
 
 1. In the editor, open the **LeechCode** panel. The status strip shows the bridge state.
-2. Click **open chat tab** (or just open chatgpt.com / claude.ai / … in the browser that has the extension). The extension connects to the local bridge at `ws://127.0.0.1:53451` automatically — the dot turns green: `1 browser connected`.
-3. Log into the chat provider once in that browser (your session persists).
-4. Type a task in the panel and hit **Send**. For the fully hands-off loop, enable `webchat.browser.autoSubmit` in Settings (⚙ in the panel).
+2. **Pair once:** on first start the editor generates a private pairing token (kept in the OS keychain). Click **Copy pairing token** on the toast (or run **LeechCode: Copy Bridge Pairing Token**), then click the WebChat Bridge toolbar icon in the browser, paste it and hit **Save & connect**. The options page shows the connection state.
+3. Click **open chat tab** (or just open chatgpt.com / claude.ai / … in the browser that has the extension). The extension connects to `ws://127.0.0.1:53451` — the dot turns green: `1 browser connected`.
+4. Log into the chat provider once in that browser (your session persists).
+5. Type a task in the panel and hit **Send**. For the fully hands-off loop, enable `webchat.browser.autoSubmit` in Settings (⚙ in the panel).
 
 ---
 
@@ -91,8 +92,13 @@ This installs into your **existing editor** (current profile) — it does **not*
 | In the composer | What it does |
 | --- | --- |
 | `@somefile` | attach specific workspace files as context |
+| `@folder/` | attach every file in a folder (type part of its name) |
+| `@problems` | attach the Problems panel (compiler / linter errors and warnings) |
+| `@git` | attach `git status` + the uncommitted diff |
+| `@open` | attach every file open in the editor |
 | `@codebase` or `/index` | index the whole workspace (chunked automatically if too large) |
-| `/ask` `/auto` `/plan` | switch agent mode |
+| `/ask` `/auto` `/plan` `/full` | switch agent mode (`/full` = full access, no approvals) |
+| `/undo` | undo the agent's last file changes (also: the **Undo** button on a change card, or **LeechCode: Undo Last Agent Changes**) |
 | `/compact` `/clear` `/open` `/close` | compact session · reset · open/close the chat browser |
 | paste a screenshot / `＋` | attach images & files (optionally analyzed by your local vision model) |
 | `model…` dropdown | switch the model on the provider page |
@@ -106,11 +112,78 @@ This installs into your **existing editor** (current profile) — it does **not*
 | Ask | review diff, then apply | approve each batch |
 | Auto-edit | applied automatically | approve each batch |
 | Plan | none | read-only exploration only |
-| Bypass | applied automatically | run automatically |
+| Full access | applied automatically | run automatically — no approvals |
 
-**Key settings** (all under the `webchat.*` namespace, editable in the in-panel ⚙ Settings or VS Code settings): `defaultProvider`, `agent.mode`, `browser.autoSubmit`, `provider.maxMessageChars` / `provider.maxSessionChars` (per-provider windows), `index.chunked` / `index.maxChunks`, `context.maxIndexChars` / `context.maxTreeChars`, `diff.showOnApply`, `vision.*` (local image→text), `session.*` (budget / compaction / rotation), `bridge.port` / `bridge.token`.
+In every mode the agent can read the project on its own: `read_file`, `list_dir`, `search`, plus VS Code's view of it — `diagnostics` (Problems panel), `open_editors`, `git_status` / `git_diff`, `symbols` (find a class/function by name) and `references` (definition + all usages). It edits existing files with small find/replace **edits** instead of resending whole files; if an edit doesn't match, nothing from that response is written and the model is told why so it can retry.
 
-> ⚠️ `bridge.port` (53451) and `bridge.token` are mirrored in `browser-extension/src/offscreen.js` — change both sides together.
+**Full access** lets the agent work on its own until the task is done: edit → run build/tests → check problems → fix, up to 25 tool rounds per task (`agent.maxToolIterations`). Safety nets:
+
+- every applied change can be undone (`/undo`, the card's **Undo**, 40 turns); undo asks before overwriting a file you changed afterwards;
+- the agent can never write inside `.git/` (a written `.git/config` or hook would run code behind your back), and the git tools run with the repository's own config neutralised and are disabled in Restricted Mode;
+- a response is applied only if *all* of its changes are valid, and a failure while writing rolls the files back;
+- commands that could destroy data outside the project — deleting a drive/home/parent folder, formatting disks, force-push, `git reset --hard`, `git clean -f`, `curl … | sh`, `sudo`, shutdown — still ask first (`agent.confirmDangerousCommands`);
+- it only runs in trusted folders (in Restricted Mode it behaves like Auto-edit), and the mode is a user setting, so a repository's `.vscode/settings.json` can't switch it on;
+- diff tabs aren't opened automatically in full access (use **View diff** on the card).
+
+> ⚠️ Full access means text coming from a web page decides which commands run on your computer. Use it on projects you have committed to git, and switch back to Ask for unfamiliar code.
+
+**Key settings** (all under the `webchat.*` namespace, editable in the in-panel ⚙ Settings or VS Code settings): `defaultProvider`, `agent.mode`, `agent.maxToolIterations`, `agent.confirmDangerousCommands`, `browser.autoSubmit`, `provider.maxMessageChars` / `provider.maxSessionChars` (per-provider windows), `index.chunked` / `index.maxChunks`, `context.maxIndexChars` / `context.maxTreeChars`, `diff.showOnApply`, `vision.*` (local image→text), `session.*` (budget / compaction / rotation), `bridge.port` / `bridge.token`.
+
+> 🔐 The bridge only accepts connections that present the per-install pairing token, and refuses WebSocket/HTTP requests coming from web-page origins. `bridge.token` is an optional advanced override (≥ 24 chars; the old `webchat-dev-token` is rejected). If you change `bridge.port`, set the same port on the browser extension's options page. **LeechCode: Regenerate Bridge Pairing Token** rotates the token and disconnects every paired browser.
+
+## Using any other AI chat site
+
+Not limited to the built-ins — any web chat with a message box works:
+
+1. In the editor: ⚙ Settings → **Custom AI sites** → enter a name and the chat URL (e.g. `Z.ai`, `https://chat.z.ai/`) → **Add**. (Or edit `webchat.customProviders` in user settings.)
+2. In the browser: click the WebChat Bridge toolbar icon → under **Custom AI sites** click **Allow** for it (Chrome asks once per site).
+3. Pick it in the panel's provider dropdown and send as usual.
+
+The extension guesses the message box, the Send button (even icon-only ones) and the reply area. If it guesses wrong, right-click the correct element on that page → **WebChat Bridge** → *Use as chat input / Send button / assistant reply*. Picks are saved per site and can be reset on the options page. This also works for fixing a built-in provider after a redesign.
+
+## Git safety net
+
+Turn on `webchat.git.autoBranch` and every task gets its own branch, so your own branch is never touched and the work survives closing the window (unlike the in-memory undo):
+
+1. You send a task → LeechCode creates `leechcode/add-login-form` from your current branch.
+2. Each applied turn is committed — **only the files the agent changed** — with a subject from the model's summary and a `LeechCode-Task:` trailer.
+3. Happy with it? Merge the branch as usual. Not happy? **LeechCode: Revert This Task's Commits** adds a revert commit (nothing is rewritten, later work is kept), or just delete the branch.
+
+If the working tree is dirty when a task starts, LeechCode asks first: new branch anyway, or stay on the current branch and only commit the agent's files. Uncommitted work is never committed, stashed or discarded behind your back. Commits skip hooks (`--no-verify`) so a long agent loop isn't blocked by a pre-commit check; run your hooks when you merge.
+
+## Second-opinion review (one AI checks another)
+
+`/review`, the **Review** button on an applied change, or **LeechCode: Review Changes With Another AI** sends the task's diff to a *different* provider:
+
+- the reviewer gets a fresh chat with the objective, the diff and the file list, and is told to make no edits;
+- its verdict (APPROVE / MINOR ISSUES / NEEDS CHANGES) and findings appear as a card in the chat;
+- **Send findings to the author** hands them back to the provider that wrote the code, which is told to verify each point against the real files first — a reviewer reading a diff can be wrong.
+
+Set the reviewer with `webchat.review.provider` (e.g. `claude` while `chatgpt` writes the code); empty picks another configured provider automatically. The reviewer's reply is always advisory: even if it returns edits or commands, they are ignored.
+
+## Your secrets stay on your machine
+
+Everything LeechCode sends lands in a third-party web page, so credentials are held back in two layers (`webchat.privacy.redactSecrets`, on by default):
+
+1. **Files that exist to hold secrets are never read** — `.env` and `.env.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, keystores, `id_rsa`/`id_ed25519`, `.npmrc`, `.netrc`, `.git-credentials`, `.ssh/`, `.aws/`, `credentials`, `secrets.*`, `service-account*.json`. They are skipped by `@codebase`, `@folder`, `@open`, `search` and `read_file`; the agent gets a short notice instead of the contents. `*.example` / `*.sample` / `*.template` files stay fully readable.
+2. **Everything actually sent is scanned** — prompts, file context, command output, git diffs and provider handovers. Recognisable credentials are masked as `***REDACTED***`: AWS keys, GitHub/GitLab/Slack/Stripe/npm/OpenAI/Anthropic/Google tokens, JWTs, private-key blocks, passwords inside connection strings and `Authorization:` headers, plus the *value* of assignments such as `DB_PASSWORD=…` or `"apiKey": "…"`.
+
+Placeholders are deliberately left alone, so documentation and code keep working for the model: `API_KEY=your-key-here`, `TOKEN=${GITHUB_TOKEN}`, `password = process.env.DB_PASSWORD`, `sk_live_replace_me`. The model is told when something was masked, so it doesn't try to guess the value.
+
+> This is a safety net, not a guarantee — a credential in an unusual format can still slip through. Treat a chat you drive this way as you would any external service.
+
+## When a request fails (provider failover)
+
+A browser page is a lossy transport: a tab closes, a login wall appears, the page goes quiet. LeechCode tracks how far each request got, because that decides what is safe to do next:
+
+| Where it failed | What happens |
+| --- | --- |
+| The prompt never reached the provider (no browser connected, no input box, login wall, page still retrying) | **Safe** — the task can be handed to another provider automatically |
+| The prompt was submitted, then the page failed or went silent | **Unclear** — the provider may already have edited files or run commands, so it is never resent automatically; LeechCode asks first |
+
+Set `webchat.failover.mode` (⚙ Settings → Agent) to `off` (just tell me), `safe` (hand over only when nothing was sent) or `always` (also offer after an unclear failure). `webchat.failover.providers` sets the order to try, and a provider that fails twice in a row is skipped for five minutes.
+
+Because a provider's own chat history can't be moved, the handover is built locally and sent as the first message of a fresh chat: the objective, files already changed, tool output already gathered, the errors, the compacted project state, and — after an unclear failure — an instruction to check the workspace with `read_file`/`git_diff`/`diagnostics` before changing anything. **LeechCode: Show Request Status** shows the current state; `webchat.request.timeoutSeconds` (default 120) bounds how long a silent page is waited for.
 
 ## When a provider changes its page
 

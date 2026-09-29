@@ -10,12 +10,19 @@ import type {
   ChatModelPayload,
   ChatNavigatePayload,
   ChatPromptPayload,
+  ProvidersSyncPayload,
   ChatStreamDeltaPayload,
   ChatStreamDonePayload,
   ChatTogglePayload
 } from "../bridge/protocol";
 import { createEnvelope } from "../bridge/protocol";
 import { LocalBridgeServer } from "../bridge/localBridgeServer";
+import {
+  generatePairingToken,
+  MIN_BRIDGE_TOKEN_LENGTH,
+  resolveBridgeToken,
+  type BridgeTokenSource
+} from "../bridge/pairing";
 import {
   buildAgentResponseRepairPrompt,
   buildAgentToolInstructions,
@@ -25,27 +32,69 @@ import {
   type AgentToolRequest
 } from "../agent/toolProtocol";
 import { describeTool, executeReadonlyTool } from "../agent/tools";
+import { dangerousCommandReason } from "../agent/commandSafety";
 import { buildCompactionPrompt } from "../prompt/compaction";
 import { buildPrompt } from "../prompt/buildPrompt";
 import { buildIndexPrimedNote, planIndexChunks } from "../prompt/indexChunker";
+import { isSecretFile, redactSecrets, redactionNote, secretFileNotice, SECRET_FILE_GLOBS } from "../prompt/redact";
+import * as git from "../workspace/gitWorkflow";
+import { buildFixPrompt, buildReviewPrompt, describeReview, readReviewOutcome, type ReviewOutcome } from "../agent/reviewPrompt";
 import { collectActiveEditorContext } from "../workspace/context";
-import { applyAgentFileChanges, type AppliedAgentChange } from "../workspace/applyAgentChanges";
+import {
+  AgentChangeError,
+  applyAgentFileChanges,
+  detectRevertConflicts,
+  resolveWorkspacePath,
+  revertAgentFileChanges,
+  type AppliedAgentChange
+} from "../workspace/applyAgentChanges";
 import { openAppliedDiffs, previewAgentFileChanges } from "../workspace/previewAgentChanges";
-import { getProvider, listProviders } from "../providers/registry";
+import {
+  findProviderByHost,
+  getProvider,
+  listCustomAdapters,
+  listProviders,
+  setCustomProviders
+} from "../providers/registry";
+import { normalizeId, type CustomProviderConfig } from "../providers/custom";
 import type { WebChatProvider } from "../providers/types";
 import type { PromptFile } from "../prompt/types";
 import {
   applyPromptUsage,
   applyResponseUsage,
+  capBudgetToWindow,
+  CHARS_PER_TOKEN,
   decideNextSessionAction,
   defaultSessionPolicy,
   estimateTokens,
+  startFreshSession,
   type SessionPolicy,
   type SessionUsage
 } from "../session/policy";
-import { CODEBASE_CONTEXT_TOKEN } from "../webview/messages";
+import {
+  CODEBASE_CONTEXT_TOKEN,
+  FOLDER_CONTEXT_PREFIX,
+  GIT_CONTEXT_TOKEN,
+  OPEN_EDITORS_CONTEXT_TOKEN,
+  PROBLEMS_CONTEXT_TOKEN
+} from "../webview/messages";
+import { collectDiagnostics, gitDiff, gitStatus, openEditorPaths, refreshDiagnostics } from "../agent/vscodeContext";
 import { cleanStreamText, stripMarkedBlock } from "./streamText";
 import { decideIndexTurn } from "./indexTurnGate";
+import {
+  chooseFailoverProvider,
+  createRequestState,
+  describePhase,
+  isFailure,
+  isTerminal,
+  isSafeToRetryElsewhere,
+  recordProviderResult,
+  reduceRequest,
+  type ProviderHealth,
+  type RequestEvent,
+  type RequestState
+} from "./taskState";
+import { buildContinuationPrompt, describeContinuation, type ContinuationPackage } from "./continuation";
 import type {
   BridgeStatusInfo,
   ContextInfo,
@@ -56,7 +105,20 @@ import type {
   WebChatSettings
 } from "../webview/messages";
 
-const MAX_TOOL_ITERATIONS = 6;
+/** Default tool-loop budget per user task; full access mode gets a larger default. */
+const DEFAULT_TOOL_ITERATIONS = 6;
+const DEFAULT_FULL_ACCESS_TOOL_ITERATIONS = 25;
+/** Tool results carried into a continuation package when switching provider. */
+const MAX_CARRIED_TOOL_RESULTS = 8;
+/** Providers tried for one task before giving up. */
+const MAX_FAILOVERS_PER_TASK = 2;
+
+/** How many applied turns can be undone (>= the full-access loop budget, so a whole task fits). */
+const MAX_UNDO_TURNS = 40;
+/** @folder reads at most this many files (the prompt budget trims further). */
+const MAX_FOLDER_MENTION_FILES = 60;
+/** Mentioned files bigger than this are skipped (binaries, bundles, data dumps). */
+const MAX_MENTION_FILE_BYTES = 400_000;
 const MAX_COMMAND_OUTPUT_CHARS = 8000;
 /** Max subagents that can be spawned within a single user task (bounds runaway delegation). */
 const MAX_SUBAGENTS = 3;
@@ -66,6 +128,14 @@ const DEFAULT_MAX_INDEX_CHUNKS = 80;
 /** How many times to re-send a chunk that looked blocked (page busy / login overlay) before stopping. */
 const MAX_INDEX_CHUNK_RETRIES = 2;
 
+const BRIDGE_TOKEN_SECRET_KEY = "webchat.bridge.pairingToken";
+
+/** WebChatSettings keys stored in user settings only (see updateSetting). */
+const USER_LEVEL_SETTINGS = new Set<string>(["agentMode", "maxToolIterations", "confirmDangerousCommands", "failoverMode"]);
+
+const COMPACT_ALONGSIDE_TASK_NOTE =
+  "Session upkeep for this turn: do the user task above fully as usual, AND make the `summary` field a thorough compacted development state (objective, current status, decisions, files changed, next actions, known errors) so a fresh chat could continue from it.";
+
 const SETTING_PATHS: Record<string, string> = {
   defaultProvider: "defaultProvider",
   includeSelectionOnly: "prompt.includeSelectionOnly",
@@ -73,12 +143,15 @@ const SETTING_PATHS: Record<string, string> = {
   agentMode: "agent.mode",
   applyMode: "agent.applyMode",
   autoRepair: "agent.autoRepairInvalidResponses",
+  maxToolIterations: "agent.maxToolIterations",
+  failoverMode: "failover.mode",
+  redactSecrets: "privacy.redactSecrets",
+  confirmDangerousCommands: "agent.confirmDangerousCommands",
   indexChunked: "index.chunked",
   visionEnabled: "vision.enabled",
   visionEndpoint: "vision.endpoint",
   visionModel: "vision.model",
   bridgePort: "bridge.port",
-  bridgeToken: "bridge.token",
   maxContextTokens: "session.maxContextTokens",
   maxInputTokens: "session.maxInputTokens",
   maxOutputTokens: "session.maxOutputTokens",
@@ -111,6 +184,7 @@ export class WebChatController implements vscode.Disposable {
     streamDone: new vscode.EventEmitter<{ turnId?: string; displayText: string; responseTokens: number }>(),
     cancelled: new vscode.EventEmitter<{ turnId?: string }>(),
     sessions: new vscode.EventEmitter<readonly SessionInfo[]>(),
+    providers: new vscode.EventEmitter<readonly ProviderInfo[]>(),
     assistantParsed: new vscode.EventEmitter<{
       turnId?: string;
       summary: string;
@@ -120,6 +194,14 @@ export class WebChatController implements vscode.Disposable {
     }>(),
     applyResult: new vscode.EventEmitter<{ applied: readonly FileChangeInfo[]; error?: string }>(),
     commandOutput: new vscode.EventEmitter<{ command: string; output: string; exitCode: number }>(),
+    undoResult: new vscode.EventEmitter<{ turnId: string; reverted: readonly string[]; remaining: number }>(),
+    reviewResult: new vscode.EventEmitter<{
+      turnId: string;
+      reviewerLabel: string;
+      verdict: string;
+      summary: string;
+      findings: readonly string[];
+    }>(),
     notice: new vscode.EventEmitter<{ level: "info" | "warn" | "error"; message: string }>()
   };
 
@@ -132,9 +214,12 @@ export class WebChatController implements vscode.Disposable {
   readonly onStreamDone = this.emitters.streamDone.event;
   readonly onCancelled = this.emitters.cancelled.event;
   readonly onSessions = this.emitters.sessions.event;
+  readonly onProviders = this.emitters.providers.event;
   readonly onAssistantParsed = this.emitters.assistantParsed.event;
   readonly onApplyResult = this.emitters.applyResult.event;
   readonly onCommandOutput = this.emitters.commandOutput.event;
+  readonly onUndoResult = this.emitters.undoResult.event;
+  readonly onReviewResult = this.emitters.reviewResult.event;
   readonly onNotice = this.emitters.notice.event;
 
   private readonly output: vscode.OutputChannel;
@@ -142,12 +227,50 @@ export class WebChatController implements vscode.Disposable {
   private bridge: LocalBridgeServer | undefined;
   private bridgeMessageDisposable: (() => void) | undefined;
   private bridgeSessionId: string;
+  /** Where the running bridge's token came from (drives the Settings UI and regenerate warnings). */
+  private bridgeTokenSource: BridgeTokenSource | undefined;
+  private activeBridgeToken: string | undefined;
+  private bridgeStarting: Promise<void> | undefined;
   private usage: SessionUsage = { promptCount: 0, inputTokensUsed: 0, outputTokensUsed: 0 };
   private activeAssistantText = "";
   private currentTurnId: string | undefined;
   private lastParsed: { turnId: string; response: AgentResponse } | undefined;
   /** Pre-edit snapshots for the most recently applied turn, powering before→after diffs. */
   private lastApplied: { turnId: string; changes: readonly AppliedAgentChange[] } | undefined;
+  /** Applied turns that can be undone, newest last (bounded). */
+  private readonly undoStack: { turnId: string; changes: readonly AppliedAgentChange[] }[] = [];
+  /** Turns whose files/tools have already been acted on (guards duplicate stream.done events). */
+  private readonly handledTurnIds = new Set<string>();
+  /** Lifecycle of the in-flight request, so a failure can be classified safe-to-retry or ambiguous. */
+  private activeRequest: RequestState | undefined;
+  /** Per-provider failure counters and cooldowns, used when choosing a failover target. */
+  private readonly providerHealth = new Map<string, ProviderHealth>();
+  /** Tool results and errors gathered for this task, carried over if we switch provider. */
+  private taskProgress: {
+    objective: string;
+    readonly toolResults: { label: string; output: string }[];
+    readonly errors: string[];
+    readonly changedFiles: { path: string; action: string }[];
+    readonly relevantFiles: string[];
+  } = { objective: "", toolResults: [], errors: [], changedFiles: [], relevantFiles: [] };
+  /** Fires when a request stops producing any page feedback, so a silent tab can't stall the task. */
+  private requestWatchdog: NodeJS.Timeout | undefined;
+  /** Set once per session so the redaction notice isn't repeated on every turn. */
+  private redactionNoticeShown = false;
+  /** Guard so one failed request triggers at most one failover. */
+  private failoverInFlight = false;
+  private failoverCount = 0;
+  /** Git branch/commits created for the current task, when the git safety net is on. */
+  private gitTask: git.GitWorkflowState | undefined;
+  /** Set while a review turn is in flight, so the reviewer's reply is never applied as edits. */
+  private reviewContext: { taskId: string; implementerId: string; reviewerId: string } | undefined;
+  private lastReview: { outcome: ReviewOutcome; reviewerId: string } | undefined;
+  /** Identifies the current user task (used for git commit trailers and review scoping). */
+  private taskId = randomUUID();
+  /** Problems to report to the model with the next tool transcript (e.g. edits that didn't apply). */
+  private pendingFeedback: string[] = [];
+  /** One-off facts to tell the model on the next user turn (e.g. "the user undid your edits"). */
+  private pendingNotes: string[] = [];
   /** The last user-initiated turn, so it can be re-sent on manual retry. */
   private lastUserDispatch: { instruction?: string; contextPaths?: readonly string[] } | undefined;
   private lastDispatchProvider: WebChatProvider | undefined;
@@ -176,6 +299,7 @@ export class WebChatController implements vscode.Disposable {
   private indexTurnTimer: NodeJS.Timeout | undefined;
   /** When true, incoming stream deltas/dones are ignored (the in-flight turn was cancelled). */
   private responseSuppressed = false;
+  private warnedUntrustedFullAccess = false;
   /** Set by the panel when a webview is live, so we can prefer inline cards over modal dialogs. */
   webviewConnected = false;
 
@@ -185,11 +309,17 @@ export class WebChatController implements vscode.Disposable {
     this.bridgeSessionId =
       context.globalState.get<string>("webchat.bridge.sessionId") || randomUUID();
     void context.globalState.update("webchat.bridge.sessionId", this.bridgeSessionId);
+    this.loadCustomProviders(false);
 
     this.disposables.push(
       vscode.window.onDidChangeActiveTextEditor(() => this.emitContext()),
       vscode.window.onDidChangeTextEditorSelection(() => this.emitContext()),
       vscode.workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration("webchat.customProviders")) {
+          this.loadCustomProviders(true);
+          this.emitters.providers.fire(this.getProvidersInfo());
+          this.syncCustomProvidersToBrowser();
+        }
         if (event.affectsConfiguration("webchat")) {
           this.emitters.settings.fire(this.getSettings());
           this.emitters.usage.fire(this.getUsageInfo());
@@ -205,6 +335,7 @@ export class WebChatController implements vscode.Disposable {
     if (this.statusPollTimer) {
       clearInterval(this.statusPollTimer);
     }
+    this.clearRequestWatchdog();
     this.indexAborted = true;
     this.finishIndexTurn();
     this.bridgeMessageDisposable?.();
@@ -238,13 +369,25 @@ export class WebChatController implements vscode.Disposable {
 
   // ---- bridge ----------------------------------------------------------------------------------
   async startBridge(silent: boolean): Promise<void> {
+    // Activation and the webview's "ready" both start the bridge; serialize them so only one
+    // server binds the port and only one token is ever generated.
+    if (!this.bridgeStarting) {
+      this.bridgeStarting = this.startBridgeOnce(silent).finally(() => {
+        this.bridgeStarting = undefined;
+      });
+    }
+    return this.bridgeStarting;
+  }
+
+  private async startBridgeOnce(silent: boolean): Promise<void> {
     if (this.bridge?.getStatus().running) {
       return;
     }
 
     const config = vscode.workspace.getConfiguration("webchat");
     const port = config.get<number>("bridge.port", 53451);
-    const token = config.get<string>("bridge.token", "webchat-dev-token");
+    const token = await this.getBridgeToken(true);
+    this.activeBridgeToken = token;
 
     this.bridge = new LocalBridgeServer({ port, token, sessionId: this.bridgeSessionId });
     this.bridgeMessageDisposable = this.bridge.onMessage((message) => this.handleBridgeMessage(message));
@@ -264,6 +407,82 @@ export class WebChatController implements vscode.Disposable {
     }
 
     this.emitters.status.fire(this.getBridgeStatus());
+  }
+
+  /**
+   * The pairing token the bridge requires. By default it is a random per-install secret kept in the
+   * editor's SecretStorage (OS keychain) — never in settings.json, so it can't leak into a repo.
+   * A strong `webchat.bridge.token` user setting overrides it; weak/legacy values are ignored.
+   */
+  private async getBridgeToken(announce: boolean): Promise<string> {
+    const configured = vscode.workspace.getConfiguration("webchat").get<string>("bridge.token", "");
+    const stored = await this.context.secrets.get(BRIDGE_TOKEN_SECRET_KEY);
+    const resolved = resolveBridgeToken(configured, stored);
+
+    if (resolved.source === "generated") {
+      await this.context.secrets.store(BRIDGE_TOKEN_SECRET_KEY, resolved.token);
+      this.output.appendLine("Generated a new bridge pairing token. Pair the browser extension with it.");
+      // First run (or after a keychain reset): the panel may not be open yet, so use a toast.
+      void vscode.window
+        .showInformationMessage(
+          "LeechCode generated a private bridge pairing token. Paste it into the WebChat Bridge browser extension (click its toolbar icon) to connect.",
+          "Copy pairing token"
+        )
+        .then((choice) => {
+          if (choice) {
+            void this.copyBridgeToken();
+          }
+        });
+    }
+    if (resolved.ignoredSetting && announce) {
+      const reason = resolved.ignoredSetting === "legacy"
+        ? "is the old public default"
+        : `is shorter than ${MIN_BRIDGE_TOKEN_LENGTH} characters`;
+      this.output.appendLine(`Ignoring webchat.bridge.token: it ${reason}. Using the generated pairing token.`);
+      this.emitters.notice.fire({
+        level: "warn",
+        message: `webchat.bridge.token ${reason} and was ignored; the generated pairing token is used instead.`
+      });
+    }
+
+    this.bridgeTokenSource = resolved.source === "setting" ? "setting" : "stored";
+    return resolved.token;
+  }
+
+  /** Copy the active pairing token so the user can paste it into the browser extension. */
+  async copyBridgeToken(): Promise<void> {
+    // Prefer the token the running bridge actually enforces (settings may have changed since).
+    const token = this.bridge?.getStatus().running && this.activeBridgeToken
+      ? this.activeBridgeToken
+      : await this.getBridgeToken(false);
+    await vscode.env.clipboard.writeText(token);
+    this.emitters.settings.fire(this.getSettings());
+    this.emitters.notice.fire({
+      level: "info",
+      message: "Bridge pairing token copied. Paste it in the WebChat Bridge extension options (click the extension icon)."
+    });
+  }
+
+  /** Replace the stored pairing token, restart the bridge and drop every paired browser. */
+  async regenerateBridgeToken(): Promise<void> {
+    await this.context.secrets.store(BRIDGE_TOKEN_SECRET_KEY, generatePairingToken());
+    if (this.bridgeTokenSource === "setting") {
+      this.emitters.notice.fire({
+        level: "warn",
+        message: "A new token was stored, but webchat.bridge.token is set and still takes precedence. Clear that setting to use the generated token."
+      });
+    }
+    await this.restartBridge();
+    await this.copyBridgeToken();
+  }
+
+  private async restartBridge(): Promise<void> {
+    await this.bridgeStarting;
+    this.bridgeMessageDisposable?.();
+    this.bridgeMessageDisposable = undefined;
+    this.bridge?.dispose();
+    this.bridge = undefined;
+    await this.startBridge(true);
   }
 
   getBridgeStatus(): BridgeStatusInfo {
@@ -341,9 +560,27 @@ export class WebChatController implements vscode.Disposable {
       // the normal single-message path (which truncates to fit / copies to clipboard as before).
     }
 
+    // Compact/rotate are decided only on fresh user turns. Tool results, subagent tasks and repairs
+    // must land in the SAME chat that asked for them — rotating there opened a new tab and sent the
+    // tool output to a conversation that never saw the request.
+    const sessionAction = forcedAction ?? (resetToolLoop ? undefined : "continue");
+    // One-off notes for the model (e.g. "the user undid your edits") ride along with the next turn.
+    // Kept out of `instruction` so they don't appear in the user's own chat bubble.
+    const notes = instruction?.trim() && this.pendingNotes.length > 0 ? this.pendingNotes.join("\n") : "";
+    if (notes) {
+      this.pendingNotes = [];
+    }
     // Include the project tree on fresh user turns; skip on tool-loop continuations (already in context).
-    const { prompt, action } = await this.buildProviderPrompt(provider, instruction, forcedAction, contextPaths, resetToolLoop);
-    this.usage = applyPromptUsage(this.usage, prompt);
+    const { prompt, action } = await this.buildProviderPrompt(
+      provider,
+      notes ? `${notes}\n\n${instruction}` : instruction,
+      sessionAction,
+      contextPaths,
+      resetToolLoop
+    );
+    // A rotate starts a new conversation, so its budget starts over. (Without this reset every later
+    // prompt was also "rotate" — a new browser tab for every single message.)
+    this.usage = action === "rotate" ? startFreshSession(prompt) : applyPromptUsage(this.usage, prompt);
     const providerLimit = this.getProviderMessageLimit(provider.id);
     if (prompt.length > providerLimit) {
       this.emitters.notice.fire({
@@ -352,7 +589,8 @@ export class WebChatController implements vscode.Disposable {
       });
     }
     this.activeAssistantText = "";
-    this.currentTurnId = randomUUID();
+    const turnId = randomUUID();
+    this.currentTurnId = turnId;
     this.lastDispatchProvider = provider;
     this.repairAttempts = 0;
 
@@ -364,7 +602,7 @@ export class WebChatController implements vscode.Disposable {
         payload: {
           providerId: provider.id,
           chatUrl: provider.chatUrl,
-          prompt,
+          prompt: this.protectOutgoing(prompt),
           promptNumber: this.usage.promptCount,
           expectedAction: action === "compact" || action === "rotate" ? action : "submit",
           autoSubmit: this.getBool("browser.autoSubmit", false),
@@ -373,9 +611,34 @@ export class WebChatController implements vscode.Disposable {
       })
     );
 
+    // Track this request's lifecycle: only a failure that happened before the page submitted may be
+    // retried on another provider.
+    this.activeRequest = reduceRequest(createRequestState(turnId, provider.id), {
+      kind: "dispatched",
+      providerId: provider.id,
+      delivered: clientCount > 0
+    });
+    this.armRequestWatchdog();
+    if (resetToolLoop && instruction?.trim()) {
+      // A fresh user turn starts a new task: reset what we carry over on a provider switch.
+      this.taskProgress = { objective: instruction.trim(), toolResults: [], errors: [], changedFiles: [], relevantFiles: [] };
+      this.failoverCount = 0;
+      this.taskId = randomUUID();
+      this.gitTask = undefined;
+      this.lastReview = undefined;
+      await this.startGitTask(instruction.trim());
+    }
+    if (contextPaths && contextPaths.length > 0) {
+      for (const path of contextPaths) {
+        if (!path.startsWith("::") && !this.taskProgress.relevantFiles.includes(path)) {
+          this.taskProgress.relevantFiles.push(path);
+        }
+      }
+    }
+
     const info: DispatchInfo = {
-      turnId: this.currentTurnId,
-      instruction: this.describeInstruction(instruction, action),
+      turnId,
+      instruction: this.describeInstruction(instruction, action), // without `notes` — that's for the model
       action,
       clientCount,
       promptTokens: estimateTokens(prompt)
@@ -387,7 +650,7 @@ export class WebChatController implements vscode.Disposable {
       await vscode.env.clipboard.writeText(prompt);
       this.emitters.notice.fire({
         level: "warn",
-        message: "No browser is connected — the prompt was copied to your clipboard instead."
+        message: "No browser is connected — the prompt was copied to your clipboard. It is still delivered if the browser reconnects within 30 seconds."
       });
     }
 
@@ -413,6 +676,7 @@ export class WebChatController implements vscode.Disposable {
     }
 
     this.responseSuppressed = true;
+    this.noteRequestEvent({ kind: "cancelled" });
     // Also abort any in-flight chunked-index delivery.
     this.indexAborted = true;
     this.finishIndexTurn();
@@ -464,7 +728,12 @@ export class WebChatController implements vscode.Disposable {
   private handleBridgeMessage(message: BridgeEnvelope): void {
     this.output.appendLine(`[${message.type}] ${JSON.stringify(message.payload)}`);
 
-    if (message.type === "pair.request" || message.type === "bridge.status") {
+    if (message.type === "pair.request") {
+      this.pollStatus();
+      this.syncCustomProvidersToBrowser(); // a (re)connected browser needs the custom AI sites
+      return;
+    }
+    if (message.type === "bridge.status") {
       this.pollStatus();
       return;
     }
@@ -473,6 +742,8 @@ export class WebChatController implements vscode.Disposable {
     if (message.type === "chat.state" || message.type === "chat.stream.done") {
       this.recordSessionFromPayload(message.payload);
     }
+
+    this.trackRequest(message);
 
     // A cancelled turn (and the follow-up "disregard" exchange) — ignore all streaming until the
     // next real dispatch clears the flag, so nothing from the abandoned prompt reaches the UI/parser.
@@ -507,7 +778,8 @@ export class WebChatController implements vscode.Disposable {
 
     if (message.type === "chat.stream.delta" && isDelta(message.payload)) {
       this.activeAssistantText = message.payload.fullText || `${this.activeAssistantText}${message.payload.text}`;
-      this.usage = applyResponseUsage(this.usage, message.payload.text);
+      // Usage is counted once, on done: a streaming page often re-renders earlier text, and then the
+      // "delta" is the whole reply again — summing deltas inflated output usage many times over.
       this.emitters.streamDelta.fire({
         turnId: this.currentTurnId,
         text: message.payload.text,
@@ -517,19 +789,35 @@ export class WebChatController implements vscode.Disposable {
       return;
     }
 
+    if (message.type === "chat.error") {
+      return; // already folded into the request state by trackRequest
+    }
+
     if (message.type === "chat.stream.done" && isDone(message.payload)) {
       this.activeAssistantText = message.payload.fullText || this.activeAssistantText;
+      this.usage = applyResponseUsage(this.usage, this.activeAssistantText);
       this.emitters.usage.fire(this.getUsageInfo());
       void this.handleAssistantDone(this.activeAssistantText, message.payload.providerId);
     }
   }
 
   private async handleAssistantDone(fullText: string, providerId?: string): Promise<void> {
+    // A provider page can emit a second chat.stream.done for the same reply (late DOM mutations
+    // after the quiescence timer). Applying a turn twice would duplicate insert-style edits and run
+    // its tools again, so side effects happen once per turn.
+    const doneTurnId = this.currentTurnId;
+    const alreadyHandled = doneTurnId !== undefined && this.handledTurnIds.has(doneTurnId);
+
     this.emitters.streamDone.fire({
       turnId: this.currentTurnId,
       displayText: stripMarkedBlock(fullText),
       responseTokens: estimateTokens(fullText)
     });
+
+    if (alreadyHandled) {
+      this.output.appendLine(`Ignored a repeated completion for turn ${doneTurnId}.`);
+      return;
+    }
 
     let response: AgentResponse | undefined;
     try {
@@ -537,6 +825,7 @@ export class WebChatController implements vscode.Disposable {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.output.appendLine(`Could not parse WebChat agent response: ${message}`);
+      this.noteRequestEvent({ kind: "parse-failed", detail: message });
       const repaired = await this.requestRepair(fullText, message, providerId);
       if (!repaired) {
         this.emitters.notice.fire({ level: "warn", message: `Agent response was not valid: ${message}` });
@@ -549,6 +838,11 @@ export class WebChatController implements vscode.Disposable {
     }
 
     const turnId = this.currentTurnId ?? randomUUID();
+    this.noteRequestEvent({ kind: "parsed" });
+    this.handledTurnIds.add(turnId);
+    if (this.handledTurnIds.size > 100) {
+      this.handledTurnIds.delete(this.handledTurnIds.values().next().value as string);
+    }
     this.lastParsed = { turnId, response };
     await this.context.globalState.update("webchat.session.summary", response.summary);
     // Mirror the summary onto the active tracked chat so resuming it later can re-prime the model.
@@ -564,13 +858,24 @@ export class WebChatController implements vscode.Disposable {
       nextSteps: response.nextSteps
     });
 
+    // A review turn is advisory: the reviewer must not edit files or run tools, whatever it replies.
+    if (this.reviewContext) {
+      await this.finishReview(response, turnId);
+      return;
+    }
+
     const mode = this.getAgentMode();
     const applyMode = this.getApplyMode();
 
-    // 1) File changes.
+    // 1) File changes. Problems (e.g. an edit whose "find" text isn't in the file) are reported
+    // back to the model together with this turn's tool output, so it can correct itself.
+    this.pendingFeedback = [];
     if (response.files.length > 0) {
       if (applyMode === "auto") {
-        await this.applyChanges(turnId);
+        const result = await this.applyChanges(turnId, { feedbackToModel: false });
+        if (!result.ok) {
+          this.pendingFeedback.push(result.feedback);
+        }
       } else if (applyMode === "ask" && !this.webviewConnected) {
         await this.askToApplyViaModal(response);
       }
@@ -579,7 +884,11 @@ export class WebChatController implements vscode.Disposable {
     // 2) Tools. Read-only tools (read_file/list_dir/search) are always safe to auto-run. Privileged
     // tools (run/spawn_subagent) require approval in ask AND auto modes; only bypass auto-runs them;
     // plan runs neither. The webview shows an approval card; headless falls back to a modal.
-    if (response.tools.length > 0) {
+    if (response.tools.length === 0) {
+      await this.flushPendingFeedback(); // edits failed and nothing else will continue the loop
+      return;
+    }
+    {
       const privileged = response.tools.filter(isPrivilegedTool);
       const readOnly = response.tools.filter((tool) => !isPrivilegedTool(tool));
 
@@ -588,7 +897,25 @@ export class WebChatController implements vscode.Disposable {
           await this.runTools(turnId, readOnly); // reading to plan is allowed; no run/spawn/edits
         }
       } else if (mode === "bypass") {
-        await this.runTools(turnId, response.tools); // full access: run everything, no prompts
+        // Full access: run everything without prompts — except commands that look destructive
+        // (wipe a drive, force-push…) when the dangerous-command guard is on.
+        const dangerous = this.getBool("agent.confirmDangerousCommands", true)
+          ? privileged.filter((tool) => tool.name === "run" && Boolean(dangerousCommandReason(tool.command)))
+          : [];
+        if (dangerous.length === 0 || (await this.confirmDangerousTools(dangerous))) {
+          await this.runTools(turnId, response.tools);
+        } else {
+          for (const tool of dangerous) {
+            this.emitters.commandOutput.fire({
+              command: `$ ${describeTool(tool)}`,
+              output: "Declined by the user (flagged as potentially destructive).",
+              exitCode: 1
+            });
+          }
+          await this.runTools(turnId, response.tools.filter((tool) => !dangerous.includes(tool)), [
+            `The user declined these commands, so they were NOT run: ${dangerous.map(describeTool).join("; ")}. Find a safer way or ask the user.`
+          ]);
+        }
       } else if (privileged.length === 0) {
         await this.runTools(turnId, readOnly); // ask/auto: read-only tools are safe to auto-run
       } else if (!this.webviewConnected) {
@@ -600,10 +927,511 @@ export class WebChatController implements vscode.Disposable {
         );
         if (choice === "Run") {
           await this.runTools(turnId, response.tools);
+        } else {
+          await this.flushPendingFeedback();
         }
       }
       // ask/auto + webview + privileged tools: wait for the approval card (runCommands message).
     }
+  }
+
+  /**
+   * Last line of defence before anything leaves the machine: mask credential-looking values in the
+   * outgoing prompt. Everything sent to a provider page goes through here — user prompts, file
+   * context, command output, git diffs and handover packages — because a web chat is a third party.
+   */
+  private protectOutgoing(prompt: string): string {
+    if (!this.getBool("privacy.redactSecrets", true)) {
+      return prompt;
+    }
+    const result = redactSecrets(prompt);
+    if (result.count === 0) {
+      return prompt;
+    }
+    this.output.appendLine(`Masked ${result.count} credential value(s) before sending: ${result.kinds.join(", ")}`);
+    if (!this.redactionNoticeShown) {
+      this.redactionNoticeShown = true;
+      this.emitters.notice.fire({
+        level: "info",
+        message: `Masked ${result.count} credential value${result.count === 1 ? "" : "s"} (${result.kinds.join(", ")}) before sending to the chat. Turn off with webchat.privacy.redactSecrets.`
+      });
+    }
+    return `${result.text}\n\n${redactionNote(result)}`;
+  }
+
+  // ---- git safety net --------------------------------------------------------------------------
+  /**
+   * Put a new task on its own branch so the user's own branch is never touched and the work can be
+   * reverted days later (unlike the in-memory undo stack). Never runs without permission when the
+   * working tree already has uncommitted changes.
+   */
+  private async startGitTask(objective: string): Promise<void> {
+    if (!this.getBool("git.autoBranch", false)) {
+      return;
+    }
+    try {
+      if (!(await git.available())) {
+        this.emitters.notice.fire({ level: "warn", message: "Git branch per task is on, but this folder is not a git repository." });
+        return;
+      }
+      if (!(await git.hasCommits())) {
+        this.emitters.notice.fire({ level: "warn", message: "Git branch per task needs at least one commit in the repository — make an initial commit first." });
+        return;
+      }
+
+      const status = await git.status();
+      if (!status.clean) {
+        const choice = await vscode.window.showWarningMessage(
+          `You have uncommitted changes in ${status.changed.length} file${status.changed.length === 1 ? "" : "s"}.`,
+          {
+            modal: true,
+            detail: `${status.changed.slice(0, 10).join("\n")}\n\nLeechCode can start this task on a new branch (your changes come along, uncommitted), or stay on ${status.branch ?? "the current branch"} and just commit what the agent changes.`
+          },
+          "New branch anyway",
+          "Stay on this branch"
+        );
+        if (choice === undefined) {
+          return; // dismissed: no branch, no commits — behave as if git integration were off
+        }
+        if (choice === "Stay on this branch") {
+          this.gitTask = { taskId: this.taskId, branch: status.branch ?? "(current)", startedFrom: status.branch, commits: 0 };
+          return;
+        }
+      }
+
+      const startedFrom = status.branch ?? (await git.currentBranch());
+      const branch = await git.createTaskBranch(
+        git.toBranchName(objective, this.getString("git.branchPrefix", "leechcode"))
+      );
+      this.gitTask = { taskId: this.taskId, branch, startedFrom, commits: 0 };
+      this.emitters.notice.fire({ level: "info", message: `Working on branch ${branch} (from ${startedFrom ?? "current"}).` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`Git branch setup skipped: ${message}`);
+      this.emitters.notice.fire({ level: "warn", message: `Could not create a task branch: ${message}` });
+    }
+  }
+
+  /** Commit exactly what the agent just changed, so every applied turn is recoverable from git. */
+  private async commitApplied(applied: readonly AppliedAgentChange[]): Promise<void> {
+    if (!this.gitTask || !this.getBool("git.autoCommit", true) || applied.length === 0) {
+      return;
+    }
+    try {
+      const message = git.toCommitMessage(
+        this.lastParsed?.response.summary || this.taskProgress.objective,
+        applied.map((change) => ({ path: change.path, action: change.action })),
+        this.taskId
+      );
+      const result = await git.commitPaths(applied.map((change) => change.path), message);
+      if (!result) {
+        return; // nothing to commit (ignored paths, or an edit that changed nothing)
+      }
+      this.gitTask.commits += 1;
+      this.emitters.notice.fire({
+        level: "info",
+        message: `Committed ${result.committed.length} file${result.committed.length === 1 ? "" : "s"} as ${result.hash} on ${this.gitTask.branch}.`
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`Could not commit agent changes: ${message}`);
+      this.emitters.notice.fire({ level: "warn", message: `Changes were applied but not committed: ${message}` });
+    }
+  }
+
+  /** Revert every commit LeechCode made for this task, keeping history (no reset, nothing lost). */
+  async revertTaskCommits(): Promise<void> {
+    try {
+      if (!(await git.available())) {
+        this.emitters.notice.fire({ level: "warn", message: "This folder is not a git repository." });
+        return;
+      }
+      const commits = await git.taskCommits(this.taskId);
+      if (commits.length === 0) {
+        this.emitters.notice.fire({ level: "info", message: "No commits from this task to revert (use Undo for uncommitted changes)." });
+        return;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        `Revert ${commits.length} commit${commits.length === 1 ? "" : "s"} from this task?`,
+        { modal: true, detail: `${commits.map((commit) => `${commit.hash} ${commit.subject}`).join("\n")}\n\nA revert commit is added; nothing is rewritten or lost.` },
+        "Revert"
+      );
+      if (choice !== "Revert") {
+        return;
+      }
+      const result = await git.revertCommits(commits.map((commit) => commit.hash));
+      if (result.conflict) {
+        this.emitters.notice.fire({
+          level: "error",
+          message: `Could not revert cleanly (${result.conflict}). The working tree was left unchanged — revert manually with git.`
+        });
+        return;
+      }
+      this.emitters.notice.fire({ level: "info", message: `Reverted ${result.reverted.length} commit${result.reverted.length === 1 ? "" : "s"} from this task.` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitters.notice.fire({ level: "error", message: `Revert failed: ${message}` });
+    }
+  }
+
+  // ---- second-opinion review -------------------------------------------------------------------
+  /**
+   * Ask a different provider to review the task's changes. The reviewer gets a fresh chat, the diff
+   * and the objective, and is told not to edit anything; its findings come back as a normal reply
+   * which is surfaced instead of applied. Afterwards the implementer provider is restored.
+   */
+  async reviewChanges(): Promise<void> {
+    if (this.reviewContext) {
+      this.emitters.notice.fire({ level: "info", message: "A review is already in progress." });
+      return;
+    }
+    const implementer = this.getCurrentProvider();
+    if (!implementer) {
+      return;
+    }
+    if (this.taskProgress.changedFiles.length === 0) {
+      this.emitters.notice.fire({ level: "info", message: "Nothing to review yet — no files were changed in this task." });
+      return;
+    }
+
+    const reviewerId = this.getString("review.provider", "") ||
+      chooseFailoverProvider(this.failoverCandidates(), implementer.id, this.providerHealth);
+    if (!reviewerId || reviewerId === implementer.id) {
+      this.emitters.notice.fire({
+        level: "warn",
+        message: "Set a different provider for reviews (webchat.review.provider) — a model cannot usefully review its own work."
+      });
+      return;
+    }
+
+    const diff = await this.collectTaskDiff();
+    const prompt = buildReviewPrompt({
+      objective: this.taskProgress.objective,
+      diff,
+      changedFiles: this.taskProgress.changedFiles,
+      implementerSummary: this.lastParsed?.response.summary || this.getStoredSummary(),
+      verification: this.taskProgress.toolResults.filter((result) => result.label.startsWith("$ ")).map((result) => result.label),
+      implementerLabel: implementer.label
+    });
+
+    this.reviewContext = { taskId: this.taskId, implementerId: implementer.id, reviewerId };
+    this.emitters.notice.fire({ level: "info", message: `Asking ${this.providerLabel(reviewerId)} to review these changes…` });
+    try {
+      await this.setProvider(reviewerId);
+      // A fresh chat: the reviewer must judge the diff, not inherit the implementer's context.
+      await this.dispatchPrompt(prompt, "rotate", undefined, false);
+    } catch (error) {
+      this.reviewContext = undefined;
+      await this.setProvider(implementer.id);
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitters.notice.fire({ level: "error", message: `Could not start the review: ${message}` });
+    }
+  }
+
+  /** Surface a review reply (never apply it) and hand the panel back to the implementer. */
+  private async finishReview(response: AgentResponse, turnId: string): Promise<void> {
+    const context = this.reviewContext;
+    this.reviewContext = undefined;
+    if (!context) {
+      return;
+    }
+
+    const outcome = readReviewOutcome(response.summary, response.nextSteps);
+    this.lastReview = { outcome, reviewerId: context.reviewerId };
+    const reviewerLabel = this.providerLabel(context.reviewerId);
+
+    this.emitters.reviewResult.fire({
+      turnId,
+      reviewerLabel,
+      verdict: outcome.verdict,
+      summary: outcome.summary,
+      findings: outcome.findings
+    });
+    this.emitters.notice.fire({
+      level: outcome.verdict === "changes" ? "warn" : "info",
+      message: `${describeReview(outcome, reviewerLabel)}${outcome.findings.length > 0 ? " Use “Send findings to the author” to have them fixed." : ""}`
+    });
+
+    if (response.files.length > 0 || response.tools.length > 0) {
+      this.output.appendLine(`Review from ${reviewerLabel} included ${response.files.length} edit(s)/${response.tools.length} tool(s); ignored (reviews are advisory).`);
+    }
+
+    await this.setProvider(context.implementerId); // back to the provider doing the work
+  }
+
+  /** Send the last review's findings to the implementer as a follow-up task. */
+  async applyReviewFindings(): Promise<void> {
+    if (!this.lastReview || this.lastReview.outcome.findings.length === 0) {
+      this.emitters.notice.fire({ level: "info", message: "No review findings to send." });
+      return;
+    }
+    const { outcome, reviewerId } = this.lastReview;
+    this.lastReview = undefined;
+    await this.dispatchPrompt(buildFixPrompt(outcome, this.providerLabel(reviewerId)), undefined, undefined, false);
+  }
+
+  /** Diff for the reviewer: from git when available, otherwise the changed files' current content. */
+  private async collectTaskDiff(): Promise<string> {
+    const maxChars = Math.max(2000, this.getNumber("review.maxDiffChars", 40000));
+    try {
+      if (await git.available()) {
+        const diff = await git.taskDiff(this.taskId, maxChars);
+        if (diff.trim()) {
+          return diff;
+        }
+      }
+    } catch (error) {
+      this.output.appendLine(`Could not build a git diff for review: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // No git (or nothing committed): send the changed files as they are now.
+    const root = vscode.workspace.workspaceFolders?.[0];
+    if (!root) {
+      return "";
+    }
+    const parts: string[] = [];
+    let used = 0;
+    for (const file of this.taskProgress.changedFiles) {
+      const content = await this.readWorkspaceText(root, file.path);
+      const block = `--- ${file.path} (${file.action}, full current content — no git diff available) ---\n${content ?? "(unreadable)"}`;
+      if (used + block.length > maxChars) {
+        parts.push(`…[${this.taskProgress.changedFiles.length - parts.length} more files omitted]`);
+        break;
+      }
+      parts.push(block);
+      used += block.length;
+    }
+    return parts.join("\n\n");
+  }
+
+  // ---- request lifecycle + provider failover ---------------------------------------------------
+  /** Fold a bridge message into the in-flight request's lifecycle. */
+  private trackRequest(message: BridgeEnvelope): void {
+    if (!this.activeRequest || this.indexingActive) {
+      return;
+    }
+    const event = requestEventFor(message);
+    if (event) {
+      this.noteRequestEvent(event);
+    }
+  }
+
+  private noteRequestEvent(event: RequestEvent): void {
+    const previous = this.activeRequest;
+    if (!previous) {
+      return;
+    }
+    const next = reduceRequest(previous, event);
+    if (next === previous) {
+      this.armRequestWatchdog(); // still alive — extend the silence timer
+      return;
+    }
+    this.activeRequest = next;
+    if (isTerminal(next.phase)) {
+      this.clearRequestWatchdog();
+    } else {
+      this.armRequestWatchdog();
+    }
+
+    if (next.phase !== previous.phase) {
+      this.output.appendLine(`[request ${next.turnId.slice(0, 8)} on ${next.providerId}] ${describePhase(next.phase)}${next.detail ? ` — ${next.detail}` : ""}`);
+    }
+    if (next.phase === "completed") {
+      this.providerHealth.set(next.providerId, recordProviderResult(this.providerHealth.get(next.providerId), next.providerId, "ok"));
+      return;
+    }
+    if (isFailure(next.phase)) {
+      this.providerHealth.set(
+        next.providerId,
+        recordProviderResult(this.providerHealth.get(next.providerId), next.providerId, "failed", next.detail)
+      );
+      this.taskProgress.errors.push(`${next.providerId}: ${describePhase(next.phase)}${next.detail ? ` — ${next.detail}` : ""}`);
+      void this.handleRequestFailure(next);
+    }
+  }
+
+  /**
+   * A provider page can simply go quiet — a closed tab, a stuck UI, a network stall — and then no
+   * state ever arrives. Without a timer the task would wait forever, so silence for long enough is
+   * itself treated as a failure (ambiguous if the prompt was already submitted).
+   */
+  private armRequestWatchdog(): void {
+    this.clearRequestWatchdog();
+    const seconds = Math.max(15, this.getNumber("request.timeoutSeconds", 120));
+    this.requestWatchdog = setTimeout(() => {
+      this.requestWatchdog = undefined;
+      this.noteRequestEvent({
+        kind: "timeout",
+        detail: `no response from the chat page for ${seconds}s`
+      });
+    }, seconds * 1000);
+  }
+
+  private clearRequestWatchdog(): void {
+    if (this.requestWatchdog) {
+      clearTimeout(this.requestWatchdog);
+      this.requestWatchdog = undefined;
+    }
+  }
+
+  private rememberToolResult(label: string, output: string): void {
+    this.taskProgress.toolResults.push({ label, output });
+    if (this.taskProgress.toolResults.length > MAX_CARRIED_TOOL_RESULTS) {
+      this.taskProgress.toolResults.shift();
+    }
+  }
+
+  /**
+   * A request failed. If it never reached the provider, optionally continue the task on another
+   * provider with a locally built handover. If the provider may already have acted, never replay
+   * automatically — duplicated edits/commands are worse than a stalled task — so ask instead.
+   */
+  private async handleRequestFailure(request: RequestState): Promise<void> {
+    if (this.failoverInFlight || this.responseSuppressed) {
+      return;
+    }
+    const mode = this.getString("failover.mode", "off");
+    if (mode === "off") {
+      this.emitters.notice.fire({
+        level: "warn",
+        message: `${this.providerLabel(request.providerId)} ${describePhase(request.phase)}. Use Retry, or switch provider (enable webchat.failover.mode to hand over automatically).`
+      });
+      return;
+    }
+    if (this.failoverCount >= MAX_FAILOVERS_PER_TASK) {
+      this.emitters.notice.fire({
+        level: "error",
+        message: `Tried ${this.failoverCount} provider${this.failoverCount === 1 ? "" : "s"} for this task without success; stopping. Check the browser tab.`
+      });
+      return;
+    }
+
+    const target = chooseFailoverProvider(this.failoverCandidates(), request.providerId, this.providerHealth);
+    if (!target) {
+      this.emitters.notice.fire({
+        level: "warn",
+        message: "No other provider is configured for failover — add one in Settings (webchat.failover.providers)."
+      });
+      return;
+    }
+
+    const safe = isSafeToRetryElsewhere(request.phase);
+    if (!safe) {
+      if (mode !== "always") {
+        this.emitters.notice.fire({
+          level: "warn",
+          message: `${this.providerLabel(request.providerId)} ${describePhase(request.phase)}, so it was NOT resent automatically (that could duplicate edits or commands). Check the tab, then use Retry or switch to ${this.providerLabel(target)}.`
+        });
+        return;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        `${this.providerLabel(request.providerId)} failed after submitting your request.`,
+        {
+          modal: true,
+          detail: `It may already have started editing files or running commands. Continuing on ${this.providerLabel(target)} could duplicate that work.\n\nThe handover tells the new provider to check the workspace first.`
+        },
+        `Continue on ${this.providerLabel(target)}`
+      );
+      if (choice === undefined) {
+        return;
+      }
+    }
+
+    await this.failoverTo(target, request);
+  }
+
+  /** Hand the task to another provider with a locally built continuation package. */
+  private async failoverTo(providerId: string, failed: RequestState): Promise<void> {
+    this.failoverInFlight = true;
+    try {
+      const pack = this.buildContinuationPackage(failed);
+      this.emitters.notice.fire({
+        level: "info",
+        message: `Continuing on ${this.providerLabel(providerId)} — ${describeContinuation(pack)}.`
+      });
+      await this.setProvider(providerId);
+      this.failoverCount += 1;
+      // "rotate" opens a fresh conversation on the new provider (it has no history to reuse).
+      await this.dispatchPrompt(buildContinuationPrompt(pack), "rotate", undefined, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitters.notice.fire({ level: "error", message: `Could not hand over to ${this.providerLabel(providerId)}: ${message}` });
+    } finally {
+      this.failoverInFlight = false;
+    }
+  }
+
+  /** Everything a fresh provider needs to carry on — the provider's own history cannot be moved. */
+  private buildContinuationPackage(failed: RequestState): ContinuationPackage {
+    return {
+      objective: this.taskProgress.objective || this.lastUserDispatch?.instruction || "",
+      phase: describePhase(failed.phase),
+      workspaceName: vscode.workspace.workspaceFolders?.[0]?.name,
+      changedFiles: [...this.taskProgress.changedFiles],
+      relevantFiles: [...this.taskProgress.relevantFiles],
+      toolResults: [...this.taskProgress.toolResults],
+      errors: [...this.taskProgress.errors],
+      summary: this.getStoredSummary() || undefined,
+      permissions: describePermissions(this.getAgentMode()),
+      checkpoint: this.undoStack.length > 0
+        ? `${this.undoStack.length} undo step${this.undoStack.length === 1 ? "" : "s"}`
+        : undefined,
+      previousRequest: {
+        providerId: this.providerLabel(failed.providerId),
+        phase: describePhase(failed.phase),
+        mayHaveActed: !isSafeToRetryElsewhere(failed.phase)
+      }
+    };
+  }
+
+  /** Ordered failover candidates: the configured list, or every provider with the current one first. */
+  private failoverCandidates(): string[] {
+    const configured = vscode.workspace.getConfiguration("webchat").get<string[]>("failover.providers", []) ?? [];
+    const known = new Set(listProviders().map((provider) => provider.id));
+    const cleaned = configured.filter((id) => known.has(id) && id !== "mock");
+    if (cleaned.length > 0) {
+      return cleaned;
+    }
+    const current = this.getString("defaultProvider", "chatgpt");
+    return [current, ...listProviders().map((provider) => provider.id).filter((id) => id !== current && id !== "mock")];
+  }
+
+  private providerLabel(providerId: string): string {
+    return getProvider(providerId)?.label ?? providerId;
+  }
+
+  /** Current request lifecycle, for the panel and the status command. */
+  getRequestStatus(): { phase: string; providerId: string; detail?: string } | undefined {
+    return this.activeRequest
+      ? {
+          phase: describePhase(this.activeRequest.phase),
+          providerId: this.providerLabel(this.activeRequest.providerId),
+          detail: this.activeRequest.detail
+        }
+      : undefined;
+  }
+
+  /** Ask before running commands the dangerous-command guard flagged (full-access mode only). */
+  private async confirmDangerousTools(tools: readonly AgentToolRequest[]): Promise<boolean> {
+    const detail = tools
+      .map((tool) => (tool.name === "run" ? `$ ${tool.command}\n   → ${dangerousCommandReason(tool.command)}` : describeTool(tool)))
+      .join("\n");
+    const choice = await vscode.window.showWarningMessage(
+      "Full access mode: the model wants to run a potentially destructive command.",
+      { modal: true, detail: `${detail}\n\n(Turn this check off with webchat.agent.confirmDangerousCommands.)` },
+      "Run anyway"
+    );
+    return choice === "Run anyway";
+  }
+
+  /** Send queued problems (failed edits) to the model when no tool transcript will carry them. */
+  private async flushPendingFeedback(): Promise<void> {
+    if (this.pendingFeedback.length === 0) {
+      return;
+    }
+    const feedback = this.pendingFeedback.join("\n\n");
+    this.pendingFeedback = [];
+    await this.continueWithToolResult(feedback);
   }
 
   /** Approve + run the pending turn's tools (webview "Approve & run" and the headless modal). */
@@ -622,8 +1450,27 @@ export class WebChatController implements vscode.Disposable {
    * commands stream their output and feed a combined transcript back to the chat; a spawn_subagent
    * launches a focused isolated continuation instead.
    */
-  private async runTools(turnId: string | undefined, tools: readonly AgentToolRequest[]): Promise<void> {
+  private async runTools(
+    turnId: string | undefined,
+    tools: readonly AgentToolRequest[],
+    notes: readonly string[] = []
+  ): Promise<void> {
+    // If this turn both edited files and asks for diagnostics, let the language servers catch up
+    // first — otherwise the model reads pre-edit problems and thinks its change compiled.
+    const justApplied = this.lastApplied?.turnId === turnId ? this.lastApplied : undefined;
+    if (justApplied && tools.some((tool) => tool.name === "diagnostics")) {
+      await refreshDiagnostics(
+        justApplied.changes.filter((change) => change.action !== "delete").map((change) => change.path)
+      );
+    }
+    // Failed edits / declined commands travel in the same continuation as the tool output, so the
+    // model gets exactly one follow-up message per turn.
+    const preamble = [...this.pendingFeedback, ...notes];
+    this.pendingFeedback = [];
     if (tools.length === 0) {
+      if (preamble.length > 0) {
+        await this.continueWithToolResult(preamble.join("\n\n"));
+      }
       return;
     }
     const subagents = tools.filter(
@@ -631,16 +1478,18 @@ export class WebChatController implements vscode.Disposable {
     );
     const infoAndRun = tools.filter((t) => t.name !== "spawn_subagent");
 
-    const transcript: string[] = [];
+    const transcript: string[] = [...preamble];
     for (const tool of infoAndRun) {
       if (tool.name === "run") {
         const result = await this.execCommand(tool.command);
         this.emitters.commandOutput.fire({ command: `$ ${tool.command}`, output: result.output, exitCode: result.exitCode });
         transcript.push(`$ ${tool.command}\n(exit code ${result.exitCode})\n${result.output || "(no output)"}`);
+        this.rememberToolResult(`$ ${tool.command} (exit ${result.exitCode})`, result.output);
       } else {
         const result = await executeReadonlyTool(tool);
         this.emitters.commandOutput.fire({ command: result.label, output: result.output, exitCode: result.ok ? 0 : 1 });
         transcript.push(`# ${result.label}\n${result.output || "(no output)"}`);
+        this.rememberToolResult(result.label, result.output);
       }
     }
 
@@ -692,8 +1541,12 @@ export class WebChatController implements vscode.Disposable {
     await this.dispatchPrompt(instruction, "continue", sub.context ?? [], false);
   }
 
-  skipCommands(): void {
+  skipCommands(turnId?: string): void {
+    if (turnId && this.lastParsed && this.lastParsed.turnId !== turnId) {
+      return; // Skip pressed on an older card — don't touch the current turn's queue
+    }
     this.emitters.notice.fire({ level: "info", message: "Skipped the requested tools." });
+    void this.flushPendingFeedback();
   }
 
   private execCommand(command: string): Promise<{ output: string; exitCode: number }> {
@@ -714,10 +1567,14 @@ export class WebChatController implements vscode.Disposable {
 
   /** Feed command output back to the chat so the model can read results and continue (capped). */
   private async continueWithToolResult(outputs: string): Promise<void> {
-    if (this.toolIterations >= MAX_TOOL_ITERATIONS) {
+    const maxIterations = this.getMaxToolIterations();
+    if (this.toolIterations >= maxIterations) {
+      // Don't lose this round's output: carry it into the next user turn so "continue" resumes with
+      // the tool results (and any failed-edit feedback) the model never saw.
+      this.pendingNotes.push(`Output of the tools from the previous round (the automatic loop paused here):\n${outputs}`);
       this.emitters.notice.fire({
         level: "warn",
-        message: `Reached the command-loop limit (${MAX_TOOL_ITERATIONS}); stopping auto-continue.`
+        message: `Reached the tool-loop limit (${maxIterations} rounds) for this task; stopping auto-continue. Send "continue" to keep going (the last tool output is carried over), or raise webchat.agent.maxToolIterations.`
       });
       return;
     }
@@ -731,40 +1588,140 @@ export class WebChatController implements vscode.Disposable {
     await this.dispatchPrompt(instruction, undefined, undefined, false);
   }
 
-  async applyChanges(turnId?: string): Promise<void> {
+  /**
+   * Apply a turn's file changes. On failure nothing is written; the problems are either returned to
+   * the caller (which batches them with tool output) or, when applied from the UI, sent to the
+   * model directly so it can resend corrected edits.
+   */
+  async applyChanges(
+    turnId?: string,
+    options: { feedbackToModel?: boolean } = {}
+  ): Promise<{ ok: true } | { ok: false; feedback: string }> {
     const files = this.resolveChanges(turnId);
     if (!files) {
       this.emitters.notice.fire({ level: "warn", message: "No pending file changes to apply." });
-      return;
+      return { ok: true };
     }
 
     try {
       const applied = await applyAgentFileChanges(files, this.context);
-      this.lastApplied = { turnId: turnId ?? this.lastParsed?.turnId ?? "", changes: applied };
+      const appliedTurn = turnId ?? this.lastParsed?.turnId ?? "";
+      this.lastApplied = { turnId: appliedTurn, changes: applied };
+      this.undoStack.push({ turnId: appliedTurn, changes: applied });
+      if (this.undoStack.length > MAX_UNDO_TURNS) {
+        this.undoStack.shift();
+      }
       this.emitters.applyResult.fire({
         applied: applied.map((change) => ({ path: change.path, action: change.action }))
       });
+      for (const change of applied) {
+        this.taskProgress.changedFiles.push({ path: change.path, action: change.action });
+      }
+      await this.commitApplied(applied);
       this.emitters.notice.fire({
         level: "info",
-        message: `Applied ${applied.length} file change${applied.length === 1 ? "" : "s"}.`
+        message: `Applied ${applied.length} file change${applied.length === 1 ? "" : "s"}. Undo: /undo or the card's Undo button.`
       });
-      // Show what changed (before→after) unless the user turned it off.
-      if (this.getBool("diff.showOnApply", true)) {
+      // Show what changed (before→after) unless the user turned it off. Full access mode doesn't
+      // open diff tabs on its own (it would flood the editor during a long autonomous loop) —
+      // the chat card's "View diff" opens them on demand.
+      if (this.getBool("diff.showOnApply", true) && this.getAgentMode() !== "bypass") {
         await openAppliedDiffs(applied, this.context);
       }
+      return { ok: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.output.appendLine(`Could not apply WebChat file changes: ${message}`);
       this.emitters.applyResult.fire({ applied: [], error: message });
       this.emitters.notice.fire({ level: "error", message: `Could not apply file changes: ${message}` });
+      const feedback = [
+        "Your file changes were NOT applied (nothing from that response was written):",
+        error instanceof AgentChangeError ? error.problems.map((problem) => `- ${problem}`).join("\n") : `- ${message}`,
+        "Re-read the affected files with read_file and send corrected changes."
+      ].join("\n");
+      if (options.feedbackToModel !== false && this.getAgentMode() !== "plan") {
+        await this.continueWithToolResult(feedback);
+      }
+      return { ok: false, feedback };
+    }
+  }
+
+  /**
+   * Undo the file changes of a turn (default: the most recent one) from the pre-edit snapshots.
+   * Files the user changed after the agent wrote them are only overwritten after confirmation.
+   */
+  async undoChanges(turnId?: string): Promise<void> {
+    const index = turnId
+      ? this.undoStack.findIndex((entry) => entry.turnId === turnId)
+      : this.undoStack.length - 1;
+    const entry = index >= 0 ? this.undoStack[index] : undefined;
+    if (!entry) {
+      this.emitters.notice.fire({ level: "info", message: "Nothing to undo." });
+      return;
+    }
+
+    let changes = entry.changes;
+    const conflicts = await detectRevertConflicts(changes);
+    if (conflicts.length > 0) {
+      const choice = await vscode.window.showWarningMessage(
+        `${conflicts.length} file${conflicts.length === 1 ? " was" : "s were"} changed after LeechCode edited ${conflicts.length === 1 ? "it" : "them"}.`,
+        { modal: true, detail: `${conflicts.join("\n")}\n\nUndo would overwrite those later edits.` },
+        "Undo all (overwrite)",
+        "Undo the others only"
+      );
+      if (!choice) {
+        return;
+      }
+      if (choice === "Undo the others only") {
+        changes = changes.filter((change) => !conflicts.includes(change.path));
+      }
+    }
+
+    try {
+      const reverted = await revertAgentFileChanges(changes);
+      // Keep anything that was NOT reverted (e.g. "undo the others only") so it stays undoable.
+      const revertedKeys = new Set(changes.map((change) => change.key));
+      const remaining = entry.changes.filter((change) => !revertedKeys.has(change.key));
+      const position = this.undoStack.indexOf(entry); // re-find: the stack may have moved while the dialog was open
+      if (position >= 0) {
+        if (remaining.length > 0) {
+          this.undoStack[position] = { turnId: entry.turnId, changes: remaining };
+        } else {
+          this.undoStack.splice(position, 1);
+        }
+      }
+      if (this.lastApplied?.turnId === entry.turnId) {
+        this.lastApplied = remaining.length > 0 ? { turnId: entry.turnId, changes: remaining } : undefined;
+      }
+      if (reverted.length > 0) {
+        this.emitters.undoResult.fire({ turnId: entry.turnId, reverted, remaining: remaining.length });
+      }
+      this.emitters.notice.fire({
+        level: "info",
+        message: reverted.length > 0
+          ? `Undid ${reverted.length} file change${reverted.length === 1 ? "" : "s"}: ${reverted.join(", ")}`
+          : "Nothing was undone."
+      });
+      if (reverted.length > 0) {
+        this.pendingNotes.push(
+          `Note: the user UNDID your earlier changes to ${reverted.join(", ")} — those files are back to their previous content. read_file them again before editing.`
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitters.notice.fire({ level: "error", message: `Undo failed: ${message}` });
     }
   }
 
   async previewChanges(turnId?: string, path?: string): Promise<void> {
     // If this turn was already applied, show the real before→after diff from the snapshots (the
     // working file already holds the new content, so a plain disk diff would be empty).
-    if (this.lastApplied && (!turnId || this.lastApplied.turnId === turnId)) {
-      const opened = await openAppliedDiffs(this.lastApplied.changes, this.context, path);
+    const appliedTurn = turnId
+      ? this.undoStack.find((entry) => entry.turnId === turnId) ??
+        (this.lastApplied?.turnId === turnId ? this.lastApplied : undefined)
+      : this.lastApplied ?? this.undoStack[this.undoStack.length - 1];
+    if (appliedTurn) {
+      const opened = await openAppliedDiffs(appliedTurn.changes, this.context, path);
       if (opened > 0) {
         this.emitters.notice.fire({ level: "info", message: `Opened ${opened} diff${opened === 1 ? "" : "s"}.` });
         return;
@@ -804,6 +1761,13 @@ export class WebChatController implements vscode.Disposable {
     this.activeAssistantText = "";
     this.lastParsed = undefined;
     this.lastApplied = undefined;
+    this.pendingFeedback = [];
+    this.pendingNotes = [];
+    this.handledTurnIds.clear();
+    this.clearRequestWatchdog();
+    this.activeRequest = undefined;
+    this.taskProgress = { objective: "", toolResults: [], errors: [], changedFiles: [], relevantFiles: [] };
+    this.failoverCount = 0;
     this.bridgeSessionId = randomUUID();
     await this.context.globalState.update("webchat.bridge.sessionId", this.bridgeSessionId);
     await this.context.globalState.update("webchat.session.summary", "");
@@ -812,6 +1776,65 @@ export class WebChatController implements vscode.Disposable {
   }
 
   // ---- providers + settings --------------------------------------------------------------------
+  /** (Re)read `webchat.customProviders` into the registry, surfacing invalid entries. */
+  private loadCustomProviders(announce: boolean): void {
+    const raw = vscode.workspace.getConfiguration("webchat").get<unknown>("customProviders", []);
+    const errors = setCustomProviders(raw);
+    for (const error of errors) {
+      this.output.appendLine(`Custom AI site skipped — ${error}`);
+    }
+    if (announce && errors.length > 0) {
+      this.emitters.notice.fire({ level: "warn", message: `Custom AI site skipped — ${errors[0]}` });
+    }
+  }
+
+  /** Tell the browser extension which custom sites to run on (it asks the user for access). */
+  private syncCustomProvidersToBrowser(): void {
+    if (!this.bridge?.getStatus().running) {
+      return;
+    }
+    this.bridge.sendToBrowsers(createEnvelope<ProvidersSyncPayload>({
+      id: randomUUID(),
+      sessionId: this.bridgeSessionId,
+      type: "providers.sync",
+      payload: { customProviders: listCustomAdapters() }
+    }));
+  }
+
+  /** Add a user-defined AI site (label + URL; selectors are optional and can be picked in the browser). */
+  async addCustomProvider(label: string, url: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration("webchat");
+    const current = config.get<CustomProviderConfig[]>("customProviders", []) ?? [];
+    const next = [...current, { label: label.trim(), url: url.trim() }];
+    const errors = setCustomProviders(next);
+    if (errors.length > 0) {
+      this.loadCustomProviders(false); // restore the registry from the unchanged setting
+      this.emitters.notice.fire({ level: "error", message: errors[errors.length - 1] });
+      return;
+    }
+    // Application scope: custom sites are a per-user choice, never picked up from a repo's settings.
+    await config.update("customProviders", next, vscode.ConfigurationTarget.Global);
+    this.emitters.notice.fire({
+      level: "info",
+      message: `Added “${label.trim()}”. In the browser, open the WebChat Bridge options page and click “Allow” for it.`
+    });
+  }
+
+  async removeCustomProvider(id: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration("webchat");
+    const current = config.get<CustomProviderConfig[]>("customProviders", []) ?? [];
+    const next = current.filter((entry) => {
+      const entryId = typeof entry?.id === "string" && entry.id.trim()
+        ? normalizeId(entry.id)
+        : safeHostId(entry?.url);
+      return entryId !== id;
+    });
+    await config.update("customProviders", next, vscode.ConfigurationTarget.Global);
+    if (this.getString("defaultProvider", "chatgpt") === id) {
+      await this.updateSetting("defaultProvider", "chatgpt");
+    }
+  }
+
   getProvidersInfo(): readonly ProviderInfo[] {
     return listProviders().map((provider) => ({
       id: provider.id,
@@ -820,7 +1843,9 @@ export class WebChatController implements vscode.Disposable {
       tags: provider.tags,
       imageSupport: provider.imageSupport,
       models: this.getProviderModels(provider.id),
-      features: provider.features
+      features: provider.features,
+      custom: provider.custom,
+      chatUrl: provider.custom ? provider.chatUrl : undefined
     }));
   }
 
@@ -974,9 +1999,7 @@ export class WebChatController implements vscode.Disposable {
     } catch {
       return;
     }
-    const provider = listProviders().find(
-      (p) => parsed.hostname === p.host || parsed.hostname.endsWith(`.${p.host}`)
-    );
+    const provider = findProviderByHost(parsed.hostname);
     if (!provider || !looksLikeConversationUrl(parsed)) {
       return;
     }
@@ -1044,13 +2067,11 @@ export class WebChatController implements vscode.Disposable {
       this.emitters.notice.fire({ level: "error", message: "Paste a full http(s) chat URL." });
       return;
     }
-    const provider = listProviders().find(
-      (p) => parsed.hostname === p.host || parsed.hostname.endsWith(`.${p.host}`)
-    );
+    const provider = findProviderByHost(parsed.hostname);
     if (!provider) {
       this.emitters.notice.fire({
         level: "warn",
-        message: `“${parsed.hostname}” isn't a supported chat provider. Use a ChatGPT/Claude/Gemini/Qwen/DeepSeek/AI Studio conversation URL.`
+        message: `“${parsed.hostname}” isn't a known chat provider. Add it under ⚙ Settings → Custom AI sites first, or use a ChatGPT/Claude/Gemini/Qwen/DeepSeek/AI Studio URL.`
       });
       return;
     }
@@ -1288,12 +2309,16 @@ export class WebChatController implements vscode.Disposable {
       agentMode: this.getAgentMode(),
       applyMode: this.getApplyMode(),
       autoRepair: config.get("agent.autoRepairInvalidResponses", true),
+      failoverMode: config.get("failover.mode", "off"),
+      redactSecrets: config.get("privacy.redactSecrets", true),
+      maxToolIterations: config.get("agent.maxToolIterations", 0),
+      confirmDangerousCommands: config.get("agent.confirmDangerousCommands", true),
       messageLimit: this.getProviderMessageLimit(config.get("defaultProvider", "chatgpt")),
       sessionLimit: this.getProviderSessionLimit(config.get("defaultProvider", "chatgpt")),
       indexChunked: config.get("index.chunked", true),
       currentProviderLabel: this.getCurrentProvider()?.label ?? "",
       bridgePort: config.get("bridge.port", 53451),
-      bridgeToken: config.get("bridge.token", "webchat-dev-token"),
+      bridgeTokenCustom: this.bridgeTokenSource === "setting",
       maxContextTokens: config.get("session.maxContextTokens", policy.budget.maxContextTokens),
       maxInputTokens: config.get("session.maxInputTokens", policy.budget.maxInputTokens),
       maxOutputTokens: config.get("session.maxOutputTokens", policy.budget.maxOutputTokens),
@@ -1325,13 +2350,16 @@ export class WebChatController implements vscode.Disposable {
     if (!path) {
       return;
     }
-    await vscode.workspace
-      .getConfiguration("webchat")
-      .update(path, value, vscode.ConfigurationTarget.Workspace);
-    if (key === "bridgePort" || key === "bridgeToken") {
+    // Settings that grant the agent autonomy are user-level only (application scope): a cloned
+    // repo's .vscode/settings.json must never be able to switch LeechCode into full access.
+    const target = USER_LEVEL_SETTINGS.has(key)
+      ? vscode.ConfigurationTarget.Global
+      : vscode.ConfigurationTarget.Workspace;
+    await vscode.workspace.getConfiguration("webchat").update(path, value, target);
+    if (key === "bridgePort") {
       this.emitters.notice.fire({
         level: "warn",
-        message: "Bridge port/token changed. Reload the window and re-pair the browser extension."
+        message: "Bridge port changed. Reload the window and set the same port in the browser extension options."
       });
     }
   }
@@ -1432,7 +2460,7 @@ export class WebChatController implements vscode.Disposable {
       return { files: [], truncated: false };
     }
     const exclude =
-      "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/.vscode-test/**,**/*.vsix,**/*.lock,**/pnpm-lock.yaml,**/package-lock.json,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.webp,**/*.ico,**/*.pdf,**/*.zip,**/*.map}";
+      `{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/.vscode-test/**,**/*.vsix,**/*.lock,**/pnpm-lock.yaml,**/package-lock.json,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.webp,**/*.ico,**/*.pdf,**/*.zip,**/*.map,${SECRET_FILE_GLOBS}}`;
     const uris = await vscode.workspace.findFiles("**/*", exclude, 1500);
     const rels = uris.map((uri) => vscode.workspace.asRelativePath(uri, false)).sort((a, b) => a.localeCompare(b));
 
@@ -1528,7 +2556,7 @@ export class WebChatController implements vscode.Disposable {
               payload: {
                 providerId: provider.id,
                 chatUrl: provider.chatUrl,
-                prompt: chunk.text,
+                prompt: this.protectOutgoing(chunk.text),
                 promptNumber: this.usage.promptCount,
                 expectedAction: "submit",
                 autoSubmit: true,
@@ -1645,7 +2673,7 @@ export class WebChatController implements vscode.Disposable {
       return undefined;
     }
     const exclude =
-      "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/.vscode-test/**,**/*.vsix,**/*.map}";
+      `{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.next/**,**/.vscode-test/**,**/*.vsix,**/*.map,${SECRET_FILE_GLOBS}}`;
     let rels: string[];
     try {
       const uris = await vscode.workspace.findFiles("**/*", exclude, 3000);
@@ -1674,23 +2702,104 @@ export class WebChatController implements vscode.Disposable {
     return { path: "PROJECT_STRUCTURE.txt", content };
   }
 
-  /** Read @-attached workspace files for inclusion in the prompt context. */
+  /**
+   * Read @-mentions for the prompt: plain workspace files, plus the special mentions —
+   * @problems (Problems panel), @git (status + diff), @open (all open editors) and @folder.
+   */
   private async collectContextFiles(paths: readonly string[]): Promise<PromptFile[]> {
     const root = vscode.workspace.workspaceFolders?.[0];
     if (!root || paths.length === 0) {
       return [];
     }
     const files: PromptFile[] = [];
-    for (const rel of paths) {
+    const seen = new Set<string>();
+    const addFile = async (rel: string) => {
+      if (seen.has(rel)) {
+        return;
+      }
+      seen.add(rel);
+      const content = await this.readWorkspaceText(root, rel);
+      if (content !== undefined) {
+        files.push({ path: rel, content });
+      }
+    };
+
+    for (const entry of paths) {
       try {
-        const uri = vscode.Uri.joinPath(root.uri, ...rel.split("/").filter(Boolean));
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        files.push({ path: rel, content: Buffer.from(bytes).toString("utf8") });
-      } catch {
-        // skip unreadable / missing files
+        if (entry === PROBLEMS_CONTEXT_TOKEN) {
+          files.push({ path: "PROBLEMS.txt", content: collectDiagnostics() });
+        } else if (entry === GIT_CONTEXT_TOKEN) {
+          files.push({ path: "GIT_CHANGES.txt", content: await this.describeGitChanges() });
+        } else if (entry === OPEN_EDITORS_CONTEXT_TOKEN) {
+          for (const rel of openEditorPaths()) {
+            await addFile(rel); // addFile → readWorkspaceText, which skips secret files
+          }
+        } else if (entry.startsWith(FOLDER_CONTEXT_PREFIX)) {
+          const folder = entry.slice(FOLDER_CONTEXT_PREFIX.length).replace(/\/+$/, "");
+          const listed = await this.listFolderFiles(root, folder);
+          files.push({
+            path: `${folder}/FOLDER_CONTENTS.txt`,
+            content: listed.length > 0
+              ? `Files in ${folder}/ (${listed.length}${listed.length >= MAX_FOLDER_MENTION_FILES ? "+, capped" : ""}):\n${listed.join("\n")}`
+              : `No readable files in ${folder}/.`
+          });
+          for (const rel of listed) {
+            await addFile(rel);
+          }
+        } else if (entry !== CODEBASE_CONTEXT_TOKEN) {
+          await addFile(entry);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        files.push({ path: `${entry.replace(/[:/\\]+/g, "_")}.error.txt`, content: `Could not collect ${entry}: ${message}` });
       }
     }
     return files;
+  }
+
+  /** git status + uncommitted (unstaged and staged) diff, for the @git mention. */
+  private async describeGitChanges(): Promise<string> {
+    const parts = [await gitStatus(), await gitDiff(undefined, false)];
+    const staged = await gitDiff(undefined, true);
+    if (!staged.startsWith("No ")) {
+      parts.push(staged);
+    }
+    return parts.join("\n\n");
+  }
+
+  /** Text files under a workspace folder, for the @folder mention (capped, no deps/build output). */
+  private async listFolderFiles(root: vscode.WorkspaceFolder, folder: string): Promise<string[]> {
+    if (folder) {
+      resolveWorkspacePath(root, folder); // rejects absolute / ../ paths
+    }
+    const exclude = `{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/build/**,**/.next/**,**/*.map,**/*.lock,**/*.min.js,${SECRET_FILE_GLOBS}}`;
+    // Base the pattern on the folder URI: a folder name containing glob characters (Next.js "app/[id]")
+    // must be taken literally, not as a character class.
+    const pattern = folder
+      ? new vscode.RelativePattern(vscode.Uri.joinPath(root.uri, ...folder.split("/").filter(Boolean)), "**/*")
+      : new vscode.RelativePattern(root, "**/*");
+    const uris = await vscode.workspace.findFiles(pattern, exclude, MAX_FOLDER_MENTION_FILES);
+    return uris
+      .map((uri) => vscode.workspace.asRelativePath(uri, false))
+      .sort((a, b) => a.localeCompare(b));
+  }
+
+  /** A workspace file's text, or undefined if it is missing, binary or too large. */
+  private async readWorkspaceText(root: vscode.WorkspaceFolder, rel: string): Promise<string | undefined> {
+    try {
+      if (isSecretFile(rel)) {
+        return secretFileNotice(rel); // never send a credential file's contents
+      }
+      const uri = resolveWorkspacePath(root, rel);
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      if (bytes.byteLength > MAX_MENTION_FILE_BYTES) {
+        return undefined;
+      }
+      const text = Buffer.from(bytes).toString("utf8");
+      return /[\x00-\x08]/.test(text) ? undefined : text;
+    } catch {
+      return undefined; // unreadable / missing / unsafe path
+    }
   }
 
   getContextInfo(): ContextInfo {
@@ -1703,7 +2812,7 @@ export class WebChatController implements vscode.Disposable {
   }
 
   getUsageInfo(): SessionUsageInfo {
-    const policy = this.getSessionPolicy();
+    const policy = this.getSessionPolicy(this.getCurrentProvider()?.id);
     const total = this.usage.inputTokensUsed + this.usage.outputTokensUsed;
     return {
       promptCount: this.usage.promptCount,
@@ -1760,7 +2869,7 @@ export class WebChatController implements vscode.Disposable {
         message: `Trimmed ${dropped} context file${dropped === 1 ? "" : "s"} to fit ${provider.label}'s ${providerLimit.toLocaleString()}-char message limit. Attach fewer files or raise the limit in Settings.`
       })
     );
-    const policy = this.getSessionPolicy();
+    const policy = this.getSessionPolicy(provider.id);
     const decided = forcedAction || decideNextSessionAction(this.usage, policy);
     const storedSummary = this.getStoredSummary();
     const agentInstructions = buildAgentToolInstructions({
@@ -1776,16 +2885,20 @@ export class WebChatController implements vscode.Disposable {
     const taskInstruction = userInstruction
       ? `User task:\n${userInstruction}`
       : "Use the following editor context to help with the user's coding task.";
+    // A scheduled compaction must never swallow what the user just asked: keep the task and ask for
+    // a thorough summary alongside it. Only a manual "compact now" (no task) is a pure compaction turn.
+    const pureCompaction = decided === "compact" && !userInstruction;
     const basePrompt = buildPrompt({
       provider,
-      instruction:
-        decided === "compact"
-          ? ["Before continuing, compact the current development state so it can seed a fresh chat later.", agentInstructions].join("\n\n")
+      instruction: pureCompaction
+        ? ["Before continuing, compact the current development state so it can seed a fresh chat later.", agentInstructions].join("\n\n")
+        : decided === "compact"
+          ? [taskInstruction, COMPACT_ALONGSIDE_TASK_NOTE, agentInstructions].join("\n\n")
           : [taskInstruction, agentInstructions].join("\n\n"),
       files
     });
     const finalPrompt =
-      decided === "compact"
+      pureCompaction
         ? `${basePrompt}\n\n${buildCompactionPrompt({ recentAssistantText: "", files })}`
         : decided === "rotate" && storedSummary
           ? `${basePrompt}\n\nContinue from this compacted state:\n${storedSummary}`
@@ -1841,7 +2954,7 @@ export class WebChatController implements vscode.Disposable {
         payload: {
           providerId: provider.id,
           chatUrl: provider.chatUrl,
-          prompt: repairPrompt,
+          prompt: this.protectOutgoing(repairPrompt),
           promptNumber: this.usage.promptCount,
           expectedAction: "continue",
           autoSubmit: this.getBool("browser.autoSubmit", false)
@@ -1871,7 +2984,10 @@ export class WebChatController implements vscode.Disposable {
       "Skip"
     );
     if (choice === "Apply Changes") {
-      await this.applyChanges(this.lastParsed?.turnId);
+      const result = await this.applyChanges(this.lastParsed?.turnId, { feedbackToModel: false });
+      if (!result.ok) {
+        this.pendingFeedback.push(result.feedback);
+      }
     } else if (choice === "Preview Diffs") {
       await this.previewChanges(this.lastParsed?.turnId);
     }
@@ -1881,11 +2997,18 @@ export class WebChatController implements vscode.Disposable {
     this.emitters.context.fire(this.getContextInfo());
   }
 
-  private getSessionPolicy(): SessionPolicy {
+  /**
+   * Session policy for a provider: the configured budget, capped to that provider's conversation
+   * window ("Max conversation length") so a fresh chat starts before the provider cuts it off.
+   */
+  private getSessionPolicy(providerId?: string): SessionPolicy {
     const config = vscode.workspace.getConfiguration("webchat");
+    const windowTokens = providerId
+      ? Math.floor(this.getProviderSessionLimit(providerId) / CHARS_PER_TOKEN)
+      : undefined;
     return {
       compactEveryPrompts: config.get("session.compactEveryPrompts", defaultSessionPolicy.compactEveryPrompts),
-      budget: {
+      budget: capBudgetToWindow({
         maxContextTokens: config.get("session.maxContextTokens", defaultSessionPolicy.budget.maxContextTokens),
         maxInputTokens: config.get("session.maxInputTokens", defaultSessionPolicy.budget.maxInputTokens),
         maxOutputTokens: config.get("session.maxOutputTokens", defaultSessionPolicy.budget.maxOutputTokens),
@@ -1893,14 +3016,35 @@ export class WebChatController implements vscode.Disposable {
           "session.rotateWhenBudgetRemainingBelow",
           defaultSessionPolicy.budget.rotateWhenBudgetRemainingBelow
         )
-      }
+      }, windowTokens)
     };
+  }
+
+  /** Tool rounds allowed per user task (webchat.agent.maxToolIterations; 0 = mode default). */
+  private getMaxToolIterations(): number {
+    const configured = Math.trunc(this.getNumber("agent.maxToolIterations", 0));
+    if (configured > 0) {
+      return Math.min(configured, 200);
+    }
+    return this.getAgentMode() === "bypass" ? DEFAULT_FULL_ACCESS_TOOL_ITERATIONS : DEFAULT_TOOL_ITERATIONS;
   }
 
   private getAgentMode(): "ask" | "auto" | "plan" | "bypass" {
     const mode = this.getString("agent.mode", "ask");
+    if (mode === "bypass" && vscode.workspace.isTrusted === false) {
+      // Restricted Mode (an untrusted folder): never auto-run the model's commands there.
+      if (!this.warnedUntrustedFullAccess) {
+        this.warnedUntrustedFullAccess = true;
+        this.emitters.notice.fire({
+          level: "warn",
+          message: "This folder isn't trusted (Restricted Mode), so full access acts like Auto-edit: commands still need your approval. Trust the folder to allow full access."
+        });
+      }
+      return "auto";
+    }
     return mode === "auto" || mode === "plan" || mode === "bypass" ? mode : "ask";
   }
+
 
   /**
    * Effective file-apply behavior, derived ONLY from the agent mode — the legacy `agent.applyMode`
@@ -2050,4 +3194,51 @@ function isDone(payload: unknown): payload is ChatStreamDonePayload {
     payload !== null &&
     typeof (payload as { fullText?: unknown }).fullText === "string"
   );
+}
+
+function safeHostId(url: unknown): string {
+  if (typeof url !== "string") {
+    return "";
+  }
+  try {
+    return normalizeId(new URL(url.trim()).hostname);
+  } catch {
+    return "";
+  }
+}
+
+/** Map a bridge message to a request-lifecycle event (undefined = not lifecycle-relevant). */
+function requestEventFor(message: BridgeEnvelope): RequestEvent | undefined {
+  switch (message.type) {
+    case "chat.state": {
+      const payload = message.payload as { state?: unknown; detail?: unknown };
+      return typeof payload?.state === "string"
+        ? { kind: "page-state", state: payload.state, detail: typeof payload.detail === "string" ? payload.detail : undefined }
+        : undefined;
+    }
+    case "chat.stream.delta":
+      return { kind: "delta" };
+    case "chat.stream.done":
+      return { kind: "response-done" };
+    case "chat.error": {
+      const payload = message.payload as { detail?: unknown };
+      return { kind: "transport-error", detail: typeof payload?.detail === "string" ? payload.detail : undefined };
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** What the new provider is allowed to do, in words, for the handover package. */
+function describePermissions(mode: "ask" | "auto" | "plan" | "bypass"): string {
+  switch (mode) {
+    case "bypass":
+      return "Full access: file edits are applied automatically and shell commands run automatically.";
+    case "auto":
+      return "Auto-edit: file edits are applied automatically; shell commands need the user's approval.";
+    case "plan":
+      return "Plan only: do not edit files or run commands.";
+    default:
+      return "Ask: the user reviews a diff before edits are applied, and approves shell commands.";
+  }
 }

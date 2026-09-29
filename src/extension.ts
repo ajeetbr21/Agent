@@ -19,6 +19,26 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("webchat.openSettings", () => provider.reveal("settings")),
     vscode.commands.registerCommand("webchat.startBridge", () => controller?.startBridge(false)),
     vscode.commands.registerCommand("webchat.showBridgeStatus", showBridgeStatus),
+    vscode.commands.registerCommand("webchat.reviewChanges", async () => {
+      await provider.reveal("chat");
+      await controller?.reviewChanges();
+    }),
+    vscode.commands.registerCommand("webchat.revertTaskCommits", () => controller?.revertTaskCommits()),
+    vscode.commands.registerCommand("webchat.undoLastChanges", async () => {
+      await provider.reveal("chat"); // so the result notice is visible
+      await controller?.undoChanges();
+    }),
+    vscode.commands.registerCommand("webchat.copyBridgeToken", () => controller?.copyBridgeToken()),
+    vscode.commands.registerCommand("webchat.regenerateBridgeToken", async () => {
+      const choice = await vscode.window.showWarningMessage(
+        "Generate a new bridge pairing token? Every paired browser disconnects until you paste the new token into it.",
+        { modal: true },
+        "Regenerate"
+      );
+      if (choice === "Regenerate") {
+        await controller?.regenerateBridgeToken();
+      }
+    }),
     vscode.commands.registerCommand("webchat.openProvider", () => controller?.openExternalProvider()),
     vscode.commands.registerCommand("webchat.sendPromptToBrowser", async () => {
       await provider.reveal("chat");
@@ -28,6 +48,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("webchat.copyPrompt", () => controller?.copyPrompt()),
     vscode.commands.registerCommand("webchat.copyContext", copyContext),
     vscode.commands.registerCommand("webchat.showSessionStatus", showSessionStatus),
+    vscode.commands.registerCommand("webchat.showRequestStatus", showRequestStatus),
     vscode.commands.registerCommand("webchat.configureSessionBudget", () => provider.reveal("settings")),
     vscode.commands.registerCommand("webchat.resetSession", () => controller?.resetSession()),
     vscode.commands.registerCommand("webchat.compactSessionNow", async () => {
@@ -89,6 +110,20 @@ async function showBridgeStatus(): Promise<void> {
   await vscode.window.showInformationMessage("WebChat browser bridge status", {
     modal: true,
     detail: [`Port: ${status.port}`, `Connected browser clients: ${status.clientCount}`].join("\n")
+  });
+}
+
+async function showRequestStatus(): Promise<void> {
+  const status = controller?.getRequestStatus();
+  if (!status) {
+    await vscode.window.showInformationMessage("No request has been sent yet in this session.");
+    return;
+  }
+  await vscode.window.showInformationMessage("LeechCode request status", {
+    modal: true,
+    detail: [`Provider: ${status.providerId}`, `State: ${status.phase}`, status.detail ? `Detail: ${status.detail}` : ""]
+      .filter(Boolean)
+      .join("\n")
   });
 }
 

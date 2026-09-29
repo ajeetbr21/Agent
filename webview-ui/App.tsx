@@ -23,10 +23,12 @@ export interface ChatMessage {
   files?: readonly FileChangeInfo[];
   summary?: string;
   nextSteps?: readonly string[];
-  changeStatus?: "pending" | "applied" | "skipped" | "error";
+  changeStatus?: "pending" | "applied" | "skipped" | "error" | "reverted";
   commands?: readonly string[];
   commandStatus?: "pending" | "running" | "done";
-  kind?: "command";
+  kind?: "command" | "review";
+  /** Review card fields (kind === "review"). */
+  review?: { reviewerLabel: string; verdict: string; summary: string; findings: readonly string[] };
   exitCode?: number;
   /** Estimated token count for this message (prompt tokens for user, response tokens for assistant). */
   tokens?: number;
@@ -152,8 +154,10 @@ function reducer(state: State, action: Action): State {
       };
     case "assistantParsed": {
       const mode = state.settings?.agentMode ?? "ask";
+      // Only full access ("bypass") runs commands without approval; ask and auto-edit wait for the
+      // approval card (showing "running" in auto-edit left the card with no buttons, stuck).
       const commandStatus =
-        message.commands.length > 0 ? (mode === "auto" ? "running" : "pending") : undefined;
+        message.commands.length > 0 ? (mode === "bypass" ? "running" : "pending") : undefined;
       return {
         ...state,
         messages: updateAssistant(state.messages, message.turnId, (m) => ({
@@ -175,6 +179,33 @@ function reducer(state: State, action: Action): State {
         ...state,
         messages: markLatestPending(state.messages, message.error ? "error" : "applied")
       };
+    case "undoResult":
+      // Only a full undo clears the card; a partial undo keeps it "applied" so the rest stays undoable.
+      if (message.remaining > 0 || message.reverted.length === 0) {
+        return state;
+      }
+      return {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.turnId === message.turnId && m.files && m.files.length > 0 ? { ...m, changeStatus: "reverted" } : m
+        )
+      };
+    case "reviewResult": {
+      const reviewMessage: ChatMessage = {
+        id: `review-${state.messages.length}-${Math.random().toString(36).slice(2, 7)}`,
+        role: "system",
+        kind: "review",
+        text: message.summary,
+        turnId: message.turnId,
+        review: {
+          reviewerLabel: message.reviewerLabel,
+          verdict: message.verdict,
+          summary: message.summary,
+          findings: message.findings
+        }
+      };
+      return { ...state, messages: [...state.messages, reviewMessage] };
+    }
     case "commandOutput": {
       const outputMessage: ChatMessage = {
         id: `cmd-${state.messages.length}-${Math.random().toString(36).slice(2, 7)}`,

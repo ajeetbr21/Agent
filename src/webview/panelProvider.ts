@@ -50,6 +50,7 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
       ),
       this.controller.onCancelled((info) => this.post({ type: "promptCancelled", turnId: info.turnId })),
       this.controller.onSessions((sessions) => this.post({ type: "sessions", sessions })),
+      this.controller.onProviders((providers) => this.post({ type: "providers", providers })),
       this.controller.onAssistantParsed((parsed) =>
         this.post({
           type: "assistantParsed",
@@ -62,6 +63,19 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
       ),
       this.controller.onApplyResult((result) =>
         this.post({ type: "applyResult", applied: result.applied, error: result.error })
+      ),
+      this.controller.onReviewResult((result) =>
+        this.post({
+          type: "reviewResult",
+          turnId: result.turnId,
+          reviewerLabel: result.reviewerLabel,
+          verdict: result.verdict,
+          summary: result.summary,
+          findings: result.findings
+        })
+      ),
+      this.controller.onUndoResult((result) =>
+        this.post({ type: "undoResult", turnId: result.turnId, reverted: result.reverted, remaining: result.remaining })
       ),
       this.controller.onCommandOutput((out) =>
         this.post({ type: "commandOutput", command: out.command, output: out.output, exitCode: out.exitCode })
@@ -115,6 +129,19 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
       case "startBridge":
         await this.controller.startBridge(false);
         return;
+      case "addCustomProvider":
+        await this.controller.addCustomProvider(message.label, message.url);
+        return;
+      case "removeCustomProvider":
+        await this.controller.removeCustomProvider(message.id);
+        return;
+      case "copyBridgeToken":
+        await this.controller.copyBridgeToken();
+        return;
+      case "regenerateBridgeToken":
+        // Goes through the command so the user gets the same confirmation dialog.
+        await vscode.commands.executeCommand("webchat.regenerateBridgeToken");
+        return;
       case "sessionAction":
         if (message.action === "compact") {
           await this.controller.compactNow();
@@ -133,11 +160,23 @@ export class WebChatViewProvider implements vscode.WebviewViewProvider {
       case "skipChanges":
         this.controller.skipChanges();
         return;
+      case "undoChanges":
+        await this.controller.undoChanges(message.turnId);
+        return;
+      case "reviewChanges":
+        await this.controller.reviewChanges();
+        return;
+      case "applyReviewFindings":
+        await this.controller.applyReviewFindings();
+        return;
+      case "revertTaskCommits":
+        await vscode.commands.executeCommand("webchat.revertTaskCommits");
+        return;
       case "runCommands":
         await this.controller.runCommands(message.turnId);
         return;
       case "skipCommands":
-        this.controller.skipCommands();
+        this.controller.skipCommands(message.turnId);
         return;
       case "cancelPrompt":
         await this.controller.cancelPrompt(message.turnId);

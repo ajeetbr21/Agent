@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>WebChat Bridge — Pairing</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="src/options.css">
+  </head>
+  <body>
+    <main>
+      <h1>WebChat Bridge</h1>
+      <p class="lead">
+        Pair this browser with the LeechCode IDE extension. In the editor run
+        <code>LeechCode: Copy Bridge Pairing Token</code> (or Settings → Bridge → <em>Copy pairing token</em>)
+        and paste it below.
+      </p>
+
+      <div id="status" class="status" data-state="unknown">
+        <span class="dot"></span>
+        <span id="status-text">Checking…</span>
+      </div>
+
+      <form id="pairing-form" autocomplete="off">
+        <label for="token">Pairing token</label>
+        <div class="row">
+          <input id="token" name="token" type="password" spellcheck="false" placeholder="Paste the token from the IDE">
+          <button id="toggle-token" type="button" class="secondary">Show</button>
+        </div>
+
+        <label for="port">Bridge port</label>
+        <input id="port" name="port" type="number" min="1024" max="65535" step="1">
+        <p class="hint">Must match <code>webchat.bridge.port</code> in the editor (default 53451).</p>
+
+        <div class="row actions">
+          <button type="submit">Save &amp; connect</button>
+          <button id="clear" type="button" class="secondary">Forget token</button>
+        </div>
+        <p id="message" class="message" role="status"></p>
+      </form>
+
+      <section>
+        <h2>Custom AI sites</h2>
+        <p class="hint">
+          Sites added in the editor under ⚙ Settings → <em>Custom AI sites</em> appear here. Chrome needs your
+          permission once per site before the extension can type into it.
+        </p>
+        <ul id="custom-list" class="custom-list"></ul>
+        <p class="hint">
+          If a site's message box, Send button or replies aren't found, right-click the correct element on that page →
+          <strong>WebChat Bridge</strong> → <em>Use as chat input / Send button / assistant reply</em>.
+        </p>
+        <ul id="override-list" class="custom-list"></ul>
+      </section>
+
+      <p class="hint">
+        The token is stored only in this browser profile (<code>chrome.storage.local</code>) and is sent only to
+        <code>127.0.0.1</code>. Web pages cannot connect to the bridge — it accepts extension origins only.
+      </p>
+    </main>
+    <script src="src/options.js"></script>
+  </body>
+</html>

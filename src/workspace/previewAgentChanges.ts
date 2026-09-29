@@ -1,7 +1,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import type { AgentFileChange } from "../agent/toolProtocol";
-import { getWorkspaceRoot, resolveWorkspacePath, type AppliedAgentChange } from "./applyAgentChanges";
+import { AgentChangeError, planAgentFileChanges, type AppliedAgentChange } from "./applyAgentChanges";
 
 const MAX_DIFF_PREVIEWS = 8;
 
@@ -52,48 +52,64 @@ export async function openAppliedDiffs(
   return opened;
 }
 
+/**
+ * Pre-apply preview: current file on disk vs what applying the whole response would produce. Uses
+ * the same planner as apply, so several edits to one file stack into a single diff and the preview
+ * can never disagree with what Apply would write.
+ */
 export async function previewAgentFileChanges(
   changes: readonly AgentFileChange[],
-  context: vscode.ExtensionContext
+  context: vscode.ExtensionContext,
+  filterPath?: string
 ): Promise<number> {
-  const root = getWorkspaceRoot();
-  const previewRoot = vscode.Uri.joinPath(
-    context.globalStorageUri,
-    "previews",
-    String(Date.now())
-  );
+  const previewRoot = vscode.Uri.joinPath(context.globalStorageUri, "previews", String(Date.now()));
   const emptyRoot = vscode.Uri.joinPath(previewRoot, "__empty__");
-  let opened = 0;
-
   await vscode.workspace.fs.createDirectory(previewRoot);
 
-  for (const change of changes.slice(0, MAX_DIFF_PREVIEWS)) {
-    const target = resolveWorkspacePath(root, change.path);
-    const preview = vscode.Uri.joinPath(previewRoot, ...splitPath(change.path));
-    const empty = vscode.Uri.joinPath(emptyRoot, ...splitPath(change.path));
-    await ensureParentDirectory(preview);
-    await ensureParentDirectory(empty);
+  let planned;
+  try {
+    planned = await planAgentFileChanges(changes);
+  } catch (error) {
+    // Show why the response can't be applied instead of opening misleading diffs.
+    const problems = error instanceof AgentChangeError ? error.problems : [error instanceof Error ? error.message : String(error)];
+    const note = vscode.Uri.joinPath(previewRoot, "CANNOT_APPLY.txt");
+    await ensureParentDirectory(note);
+    await vscode.workspace.fs.writeFile(
+      note,
+      Buffer.from(["These changes cannot be applied as-is:", ...problems.map((problem) => `- ${problem}`)].join("\n"), "utf8")
+    );
+    await vscode.window.showTextDocument(note, { preview: true });
+    return 0;
+  }
 
-    if (change.action === "delete") {
-      await vscode.workspace.fs.writeFile(empty, new Uint8Array());
-      await vscode.commands.executeCommand(
-        "vscode.diff",
-        await uriOrEmpty(target, empty),
-        empty,
-        `WebChat delete preview: ${change.path}`
-      );
-      opened += 1;
+  // One diff per file: the last planned entry holds the fully stacked result.
+  const finalByFile = new Map<string, (typeof planned)[number]>();
+  for (const item of planned) {
+    finalByFile.set(item.key, item);
+  }
+
+  let opened = 0;
+  for (const item of finalByFile.values()) {
+    if (filterPath && item.change.path !== filterPath) {
       continue;
     }
-
-    await vscode.workspace.fs.writeFile(preview, Buffer.from(change.content || "", "utf8"));
+    if (opened >= MAX_DIFF_PREVIEWS) {
+      break;
+    }
+    const relative = splitPath(item.change.path);
+    const preview = vscode.Uri.joinPath(previewRoot, ...relative);
+    const empty = vscode.Uri.joinPath(emptyRoot, ...relative);
+    await ensureParentDirectory(preview);
+    await ensureParentDirectory(empty);
     await vscode.workspace.fs.writeFile(empty, new Uint8Array());
-    await vscode.commands.executeCommand(
-      "vscode.diff",
-      await uriOrEmpty(target, empty),
-      preview,
-      `WebChat write preview: ${change.path}`
-    );
+    await vscode.workspace.fs.writeFile(preview, item.next ?? new Uint8Array());
+
+    const left = item.existedBefore ? item.target : empty;
+    const right = item.next ? preview : empty;
+    const label = item.next
+      ? `WebChat ${item.existedBefore ? "change" : "new file"} preview: ${item.change.path}`
+      : `WebChat delete preview: ${item.change.path}`;
+    await vscode.commands.executeCommand("vscode.diff", left, right, label);
     opened += 1;
   }
 
@@ -102,15 +118,6 @@ export async function previewAgentFileChanges(
 
 function splitPath(relativePath: string): string[] {
   return path.normalize(relativePath).replaceAll("\\", "/").split("/").filter(Boolean);
-}
-
-async function uriOrEmpty(target: vscode.Uri, empty: vscode.Uri): Promise<vscode.Uri> {
-  try {
-    await vscode.workspace.fs.stat(target);
-    return target;
-  } catch {
-    return empty;
-  }
 }
 
 async function ensureParentDirectory(target: vscode.Uri): Promise<void> {

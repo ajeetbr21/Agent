@@ -3,6 +3,14 @@
 
 /** Sentinel context path meaning "index the entire workspace" (used by @codebase and /index). */
 export const CODEBASE_CONTEXT_TOKEN = "::codebase::";
+/** @problems — the Problems panel (compiler/linter errors and warnings). */
+export const PROBLEMS_CONTEXT_TOKEN = "::problems::";
+/** @git — git status and the uncommitted diff. */
+export const GIT_CONTEXT_TOKEN = "::git::";
+/** @open — every file open in the editor. */
+export const OPEN_EDITORS_CONTEXT_TOKEN = "::open::";
+/** @folder — prefix + workspace-relative folder, e.g. "::folder::src/agent". */
+export const FOLDER_CONTEXT_PREFIX = "::folder::";
 
 export interface ProviderInfo {
   readonly id: string;
@@ -12,11 +20,14 @@ export interface ProviderInfo {
   readonly imageSupport?: string;
   readonly models?: readonly string[];
   readonly features?: readonly { id: string; label: string; icon?: string }[];
+  /** True for user-defined AI sites (webchat.customProviders). */
+  readonly custom?: boolean;
+  readonly chatUrl?: string;
 }
 
 export interface FileChangeInfo {
   readonly path: string;
-  readonly action: "write" | "delete";
+  readonly action: "write" | "delete" | "edit";
 }
 
 export interface SessionUsageInfo {
@@ -37,12 +48,20 @@ export interface BridgeStatusInfo {
 }
 
 export interface WebChatSettings {
+  /** off · safe · always — what happens when a request fails in the browser. */
+  readonly failoverMode: string;
+  /** Mask credentials, and never read credential files, before anything is sent to a chat page. */
+  readonly redactSecrets: boolean;
   readonly defaultProvider: string;
   readonly includeSelectionOnly: boolean;
   readonly autoSubmit: boolean;
   readonly agentMode: "ask" | "auto" | "plan" | "bypass";
   readonly applyMode: "ask" | "auto" | "never";
   readonly autoRepair: boolean;
+  /** Tool rounds per user task (0 = mode default: 6, or 25 in full access). */
+  readonly maxToolIterations: number;
+  /** In full access, still ask before commands that look destructive. */
+  readonly confirmDangerousCommands: boolean;
   /** Effective per-message character limit for the current provider (customizable). */
   readonly messageLimit: number;
   /** Effective total conversation character budget for the current provider (caps a chunked index). */
@@ -51,7 +70,8 @@ export interface WebChatSettings {
   readonly indexChunked: boolean;
   readonly currentProviderLabel: string;
   readonly bridgePort: number;
-  readonly bridgeToken: string;
+  /** True when the `webchat.bridge.token` setting overrides the generated pairing token. */
+  readonly bridgeTokenCustom: boolean;
   readonly maxContextTokens: number;
   readonly maxInputTokens: number;
   readonly maxOutputTokens: number;
@@ -131,6 +151,21 @@ export type HostToWebview =
     }
   | { readonly type: "applyResult"; readonly applied: readonly FileChangeInfo[]; readonly error?: string }
   | {
+      readonly type: "reviewResult";
+      readonly turnId: string;
+      readonly reviewerLabel: string;
+      readonly verdict: string;
+      readonly summary: string;
+      readonly findings: readonly string[];
+    }
+  | {
+      readonly type: "undoResult";
+      readonly turnId: string;
+      readonly reverted: readonly string[];
+      /** Changes from that turn that were kept (still undoable). */
+      readonly remaining: number;
+    }
+  | {
       readonly type: "commandOutput";
       readonly command: string;
       readonly output: string;
@@ -156,10 +191,18 @@ export type WebviewToHost =
   | { readonly type: "launchBrowser" }
   | { readonly type: "closeBrowser" }
   | { readonly type: "startBridge" }
+  | { readonly type: "copyBridgeToken" }
+  | { readonly type: "addCustomProvider"; readonly label: string; readonly url: string }
+  | { readonly type: "removeCustomProvider"; readonly id: string }
+  | { readonly type: "regenerateBridgeToken" }
   | { readonly type: "sessionAction"; readonly action: "compact" | "rotate" | "reset" }
   | { readonly type: "applyChanges"; readonly turnId?: string; readonly files: readonly FileChangeInfo[] }
   | { readonly type: "previewChanges"; readonly turnId?: string; readonly path?: string }
   | { readonly type: "skipChanges"; readonly turnId?: string }
+  | { readonly type: "undoChanges"; readonly turnId?: string }
+  | { readonly type: "reviewChanges" }
+  | { readonly type: "applyReviewFindings" }
+  | { readonly type: "revertTaskCommits" }
   | { readonly type: "runCommands"; readonly turnId?: string }
   | { readonly type: "skipCommands"; readonly turnId?: string }
   | { readonly type: "cancelPrompt"; readonly turnId?: string }

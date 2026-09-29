@@ -1,9 +1,13 @@
 import { extractAgentJson } from "./responseFormat";
+import type { TextEdit } from "./fileEdits";
 
 export interface AgentFileChange {
   readonly path: string;
-  readonly action: "write" | "delete";
+  readonly action: "write" | "delete" | "edit";
+  /** Full new content (write). */
   readonly content?: string;
+  /** Targeted find/replace edits applied to the current file (edit). */
+  readonly edits?: readonly TextEdit[];
 }
 
 /**
@@ -15,6 +19,12 @@ export type AgentToolRequest =
   | { readonly name: "read_file"; readonly path: string; readonly startLine?: number; readonly endLine?: number }
   | { readonly name: "list_dir"; readonly path: string }
   | { readonly name: "search"; readonly query: string; readonly glob?: string }
+  | { readonly name: "diagnostics"; readonly path?: string }
+  | { readonly name: "open_editors" }
+  | { readonly name: "git_status" }
+  | { readonly name: "git_diff"; readonly path?: string; readonly staged?: boolean }
+  | { readonly name: "symbols"; readonly query: string }
+  | { readonly name: "references"; readonly path: string; readonly symbol: string; readonly line?: number }
   | { readonly name: "run"; readonly command: string }
   | { readonly name: "spawn_subagent"; readonly task: string; readonly context?: readonly string[] };
 
@@ -47,30 +57,35 @@ export function buildAgentToolInstructions(input: {
     ? `\nPrevious compacted session state:\n${input.previousSummary}\n`
     : "";
   const mode = input.mode ?? "ask";
-  const autoEdits = mode === "auto" || mode === "bypass";
-
   // The agent mode manipulates what we ask the model to produce.
   const modeInstruction =
     mode === "plan"
       ? "MODE: PLAN. Do NOT write or change any files this turn. Respond with a concise, numbered implementation plan in `summary` and `nextSteps`, and return an empty `files` array. The user will switch to an edit mode to apply it."
-      : autoEdits
-        ? "MODE: AUTO-EDIT. Make the complete edits needed to fully satisfy the task and return them as file writes. The IDE applies them automatically, so include every file required to run."
+      : mode === "bypass"
+        ? "MODE: FULL ACCESS. The developer has given you full autonomy: your edits are applied and your tools (including run) execute immediately, with no approval step. Work like a senior engineer on their machine — explore (read_file/search/symbols/diagnostics), make the edits, then verify (build/tests/diagnostics) and fix what fails, looping until the task is really done. Keep changes scoped to the task, never touch files outside the workspace, and don't run destructive or irreversible commands (deleting outside build folders, force-pushing, resetting git history) unless the user explicitly asked."
+      : mode === "auto"
+        ? "MODE: AUTO-EDIT. Make the complete edits needed to fully satisfy the task. The IDE applies them automatically (shell commands still need the user's approval), so include every change required to run."
         : "MODE: ASK. Propose the complete edits as file writes. The user will review a diff and approve before anything is applied, so make the changes self-contained and easy to review.";
 
   const allowSubagents = input.allowSubagents ?? true;
   const toolsDoc =
     mode === "plan"
-      ? "You may READ to plan (read_file, list_dir, search) but must NOT run shell commands or edit files this turn."
+      ? "You may READ to plan (read_file, list_dir, search, diagnostics, open_editors, git_status, git_diff, symbols, references) but must NOT run shell commands or edit files this turn."
       : [
           "You have a full coding toolbelt. Request tools in a \"tools\" array; the IDE executes them and sends you their output as the next message so you can read results and continue (a tool loop). Available tools:",
           "  • {\"name\":\"read_file\",\"path\":\"rel/path\"} — read a file (optional \"startLine\"/\"endLine\" for a slice).",
           "  • {\"name\":\"list_dir\",\"path\":\"rel/dir\"} — list a directory's entries.",
           "  • {\"name\":\"search\",\"query\":\"regex or text\",\"glob\":\"**/*.ts\"} — search file contents (glob optional).",
+          "  • {\"name\":\"diagnostics\",\"path\":\"rel/path\"} — the editor's Problems panel: compiler/linter errors and warnings (omit path for the whole workspace). Check it after editing.",
+          "  • {\"name\":\"open_editors\"} — files the developer has open, which one is active, unsaved changes and the selected lines.",
+          "  • {\"name\":\"git_status\"} / {\"name\":\"git_diff\",\"path\":\"rel/path\",\"staged\":false} — current branch, changed files and the uncommitted diff (path/staged optional).",
+          "  • {\"name\":\"symbols\",\"query\":\"UserService\"} — find classes/functions/variables by name across the workspace (language server).",
+          "  • {\"name\":\"references\",\"path\":\"rel/path\",\"symbol\":\"login\",\"line\":42} — definition and every usage of a symbol that appears in that file (line optional, picks the nearest occurrence).",
           "  • {\"name\":\"run\",\"command\":\"npm test\"} — run ANY shell command in the workspace root: git (e.g. `git diff`, `git status`), build, run, tests, linters (eslint), formatters (prettier), package managers, etc.",
           allowSubagents
             ? "  • {\"name\":\"spawn_subagent\",\"task\":\"self-contained instruction\",\"context\":[\"rel/path\"]} — delegate a focused sub-task to a fresh isolated agent that only sees the task + the files you list. It runs its own tool loop and returns a concise result summary to you. Use it to parallelize/scope large work; a subagent cannot itself spawn subagents."
             : "",
-          `Read-only tools (read_file/list_dir/search) run automatically. \`run\` commands${allowSubagents ? " and spawn_subagent are" : " are"} approved per agent mode. The legacy "commands":["…"] array is still accepted and equals a list of run tools.`,
+          `Read-only tools (read_file, list_dir, search, diagnostics, open_editors, git_status, git_diff, symbols, references) run automatically. \`run\` commands${allowSubagents ? " and spawn_subagent are" : " are"} approved per agent mode. The legacy "commands":["…"] array is still accepted and equals a list of run tools.`,
           `Explore with read_file/list_dir/search before editing, verify with \`run\` (build/tests/lint) afterward${allowSubagents ? ", and delegate independent chunks with spawn_subagent" : ""}. Stop requesting tools once the task is done and verified.`
         ]
           .filter(Boolean)
@@ -91,16 +106,17 @@ export function buildAgentToolInstructions(input: {
     "Return edits and tool requests only through the exact JSON block shown below. Prefer the plain <webchat_agent_response> markers with no markdown fences; if your platform forces code formatting, a ```json fenced block containing the same JSON object is also accepted. Never HTML-escape the markers and never put them inside backticks.",
     "Request tools ONLY via the \"tools\" array in that JSON. Do NOT emit tool_code / python / function-call code blocks — the IDE does not execute those.",
     "Use workspace-relative paths only. Never use absolute paths or parent-directory traversal.",
-    "A PROJECT_STRUCTURE.txt listing the repository's files is included so you know the layout. Before editing an EXISTING file, first read_file it and modify its ACTUAL current content — never rewrite a file you have not read, or you will lose existing content. Writes replace the whole file.",
-    "For each complete file you want changed, use {\"path\":\"relative/path\",\"action\":\"write\",\"contentBase64\":\"UTF-8 base64 full file contents\"}.",
-    "Prefer contentBase64 for every write. The IDE also accepts content for tiny plain-text files, but raw code strings are easy to make invalid JSON.",
+    "A PROJECT_STRUCTURE.txt listing the repository's files is included so you know the layout. Before editing an EXISTING file, first read_file it and work from its ACTUAL current content — never rewrite a file you have not read, or you will lose existing content.",
+    "To change part of an EXISTING file, prefer a targeted edit (much smaller than resending the file): {\"path\":\"src/app.ts\",\"action\":\"edit\",\"edits\":[{\"findBase64\":\"<base64 of exact current text>\",\"replaceBase64\":\"<base64 of new text>\"}]}. Each find must match the current file exactly once — copy it from read_file and include a few surrounding lines to make it unique (or add \"all\":true to replace every occurrence). Plain \"find\"/\"replace\" strings are accepted for short, JSON-safe text. If an edit fails, the IDE tells you why in the next message and applies nothing from that response.",
+    "To create a new file or rewrite a small one, use {\"path\":\"relative/path\",\"action\":\"write\",\"contentBase64\":\"UTF-8 base64 full file contents\"} — a write replaces the whole file.",
+    "Prefer the Base64 fields for code. The IDE also accepts plain content/find/replace strings for tiny plain-text snippets, but raw code strings are easy to make invalid JSON.",
     "The marked block must be valid JSON that can be parsed with JSON.parse.",
     "For deletions, use {\"path\":\"relative/path\",\"action\":\"delete\"}.",
     `Current session action: ${input.action}.`,
     `Configured total context limit: ${input.maxContextTokens} approximate tokens.`,
     `Compaction cadence: every ${input.compactEveryPrompts} prompts.`,
     input.action === "compact"
-      ? "This turn must compact the current development state in summary and include no file edits unless essential."
+      ? "This turn also compacts the session: make summary a thorough compacted development state. If the user gave a task, still complete it (file edits and tools are allowed)."
       : "",
     input.action === "rotate"
       ? "This turn is for a fresh chat session. Start from the previous summary, then continue the work."
@@ -111,7 +127,8 @@ export function buildAgentToolInstructions(input: {
     "{",
     "  \"summary\": \"short durable plan/state for future chats\",",
     "  \"files\": [",
-    "    {\"path\":\"demo/example/index.html\",\"action\":\"write\",\"contentBase64\":\"PG1haW4+SGVsbG88L21haW4+\"}",
+    "    {\"path\":\"demo/example/index.html\",\"action\":\"write\",\"contentBase64\":\"PG1haW4+SGVsbG88L21haW4+\"},",
+    "    {\"path\":\"src/config.ts\",\"action\":\"edit\",\"edits\":[{\"find\":\"retries: 3\",\"replace\":\"retries: 5\"}]}",
     "  ],",
     "  \"tools\": [{\"name\":\"read_file\",\"path\":\"src/app.ts\"}, {\"name\":\"run\",\"command\":\"npm test\"}],",
     "  \"nextSteps\": [\"short next step\"]",
@@ -200,6 +217,23 @@ function readToolRequest(item: unknown): AgentToolRequest | undefined {
       const glob = typeof item.glob === "string" && item.glob.trim() ? item.glob.trim() : undefined;
       return { name: "search", query: item.query, glob };
     }
+    case "diagnostics":
+      return { name: "diagnostics", path: optionalString(item.path) };
+    case "open_editors":
+      return { name: "open_editors" };
+    case "git_status":
+      return { name: "git_status" };
+    case "git_diff":
+      return { name: "git_diff", path: optionalString(item.path), staged: item.staged === true ? true : undefined };
+    case "symbols": {
+      const query = optionalString(item.query);
+      return query ? { name: "symbols", query } : undefined;
+    }
+    case "references": {
+      const path = optionalString(item.path);
+      const symbol = optionalString(item.symbol);
+      return path && symbol ? { name: "references", path, symbol, line: toPositiveInt(item.line) } : undefined;
+    }
     case "run":
       return typeof item.command === "string" && item.command.trim()
         ? { name: "run", command: item.command.trim() }
@@ -216,6 +250,10 @@ function readToolRequest(item: unknown): AgentToolRequest | undefined {
     default:
       return undefined;
   }
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function toPositiveInt(value: unknown): number | undefined {
@@ -244,7 +282,7 @@ export function buildAgentResponseRepairPrompt(input: {
     "",
     "Return only a corrected WebChat agent response block (a ```json fenced block with the same JSON is also accepted).",
     "The block must be valid JSON parseable by JSON.parse.",
-    "For every write, use contentBase64 with UTF-8 base64 file contents. Do not use raw content strings for code.",
+    "For every write, use contentBase64 with UTF-8 base64 file contents; for edits use findBase64/replaceBase64. Do not use raw strings for code.",
     "Use this exact shape:",
     START_MARKER,
     "{",
@@ -286,8 +324,12 @@ function readFileChanges(value: unknown): AgentFileChange[] {
     const path = readString(item, "path");
     const action = item.action;
 
-    if (action !== "write" && action !== "delete") {
+    if (action !== "write" && action !== "delete" && action !== "edit") {
       throw new Error(`Unsupported file action for ${path}.`);
+    }
+
+    if (action === "edit") {
+      return { path, action, edits: readTextEdits(item, path) };
     }
 
     if (action === "write") {
@@ -303,6 +345,52 @@ function readFileChanges(value: unknown): AgentFileChange[] {
       action
     };
   });
+}
+
+/**
+ * Edits come as {"edits":[{find|findBase64, replace|replaceBase64, all?}, …]} or, for a single edit,
+ * the same fields directly on the file entry.
+ */
+function readTextEdits(item: Record<string, unknown>, path: string): TextEdit[] {
+  const raw = Array.isArray(item.edits) ? item.edits : [item];
+  const edits = raw.map((entry, index) => {
+    if (!isRecord(entry)) {
+      throw new Error(`Edit ${index + 1} for ${path} must be a JSON object.`);
+    }
+    const find = readEncodedText(entry, "find");
+    const replace = readEncodedText(entry, "replace");
+    if (find === undefined || replace === undefined) {
+      throw new Error(`Edit ${index + 1} for ${path} needs "find"/"findBase64" and "replace"/"replaceBase64".`);
+    }
+    return entry.all === true ? { find, replace, all: true } : { find, replace };
+  });
+  if (edits.length === 0) {
+    throw new Error(`Edit action for ${path} has no edits.`);
+  }
+  return edits;
+}
+
+function readEncodedText(value: Record<string, unknown>, property: string): string | undefined {
+  const encoded = value[`${property}Base64`];
+  if (typeof encoded === "string") {
+    return decodeBase64Strict(encoded, `${property}Base64`);
+  }
+  const plain = value[property];
+  return typeof plain === "string" ? plain : undefined;
+}
+
+/**
+ * Node's base64 decoder silently ignores stray characters and decodes truncated input to a prefix.
+ * For an edit that would mean matching a shortened "find" and leaving old code behind, so the value
+ * is re-encoded and compared instead.
+ */
+function decodeBase64Strict(encoded: string, field: string): string {
+  const buffer = Buffer.from(encoded, "base64");
+  const normalized = encoded.replace(/\s+/g, "");
+  if (buffer.toString("base64").replace(/=+$/, "") !== normalized.replace(/=+$/, "").replace(/-/g, "+").replace(/_/g, "/")) {
+    throw new Error(`${field} is not valid base64 (it looks truncated or corrupted) — re-send the whole value.`);
+  }
+  return buffer.toString("utf8");
 }
 
 function readNextSteps(value: unknown): string[] {
@@ -321,7 +409,7 @@ function readWriteContent(value: Record<string, unknown>): string {
   const encoded = value.contentBase64;
 
   if (typeof encoded === "string") {
-    return Buffer.from(encoded, "base64").toString("utf8");
+    return decodeBase64Strict(encoded, "contentBase64");
   }
 
   return readString(value, "content");

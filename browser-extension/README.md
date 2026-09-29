@@ -5,6 +5,7 @@ This browser extension is the bridge between real web AI chat pages and the WebC
 Current bridge:
 
 - Detects supported provider pages.
+- Pairs with the IDE using the per-install pairing token pasted on the options page (click the toolbar icon); the token lives in `chrome.storage.local`.
 - Keeps the localhost WebSocket alive from a Manifest V3 offscreen document.
 - Uses the background service worker as a router between the offscreen bridge and provider tabs.
 - Inserts prompts into supported web chat inputs.

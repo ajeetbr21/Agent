@@ -84,6 +84,36 @@
         "category": "LeechCode"
       },
       {
+        "command": "webchat.reviewChanges",
+        "title": "Review Changes With Another AI",
+        "category": "LeechCode"
+      },
+      {
+        "command": "webchat.revertTaskCommits",
+        "title": "Revert This Task's Commits",
+        "category": "LeechCode"
+      },
+      {
+        "command": "webchat.showRequestStatus",
+        "title": "Show Request Status",
+        "category": "LeechCode"
+      },
+      {
+        "command": "webchat.undoLastChanges",
+        "title": "Undo Last Agent Changes",
+        "category": "LeechCode"
+      },
+      {
+        "command": "webchat.copyBridgeToken",
+        "title": "Copy Bridge Pairing Token",
+        "category": "LeechCode"
+      },
+      {
+        "command": "webchat.regenerateBridgeToken",
+        "title": "Regenerate Bridge Pairing Token",
+        "category": "LeechCode"
+      },
+      {
         "command": "webchat.openProvider",
         "title": "Open Web Chat",
         "category": "LeechCode"
@@ -154,6 +184,7 @@
         "webchat.agent.mode": {
           "type": "string",
           "default": "ask",
+          "scope": "application",
           "enum": [
             "ask",
             "auto",
@@ -164,9 +195,23 @@
             "Ask: review a diff before applying edits, and approve any tool/command runs.",
             "Auto-edit: apply file changes automatically, but still approve tool/command runs.",
             "Plan: return a step-by-step plan only — no edits, no commands.",
-            "Bypass: full access — apply edits AND run tools/commands automatically, no prompts."
+            "Full access: apply edits AND run tools/commands automatically, no approvals (destructive commands still ask unless webchat.agent.confirmDangerousCommands is off). Every change can be undone."
           ],
-          "description": "Agent mode. Controls whether LeechCode asks before applying edits and running tools."
+          "description": "Agent mode. Controls whether LeechCode asks before applying edits and running tools. User-level only, so a repository's settings can't change it."
+        },
+        "webchat.agent.maxToolIterations": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 200,
+          "scope": "application",
+          "description": "How many tool rounds (read → edit → run → read…) the agent may do for one task before pausing. 0 = default (6, or 25 in full access)."
+        },
+        "webchat.agent.confirmDangerousCommands": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "In full access mode, still ask before running commands that look destructive: deleting a drive/home/parent folder, formatting disks, force-pushing, git reset --hard / clean -f, piping a downloaded script into a shell, sudo, shutdown."
         },
         "webchat.prompt.includeSelectionOnly": {
           "type": "boolean",
@@ -210,7 +255,7 @@
           "additionalProperties": {
             "type": "number"
           },
-          "markdownDescription": "Per-provider total character budget for one chat conversation, e.g. `{ \"chatgpt\": 240000, \"claude\": 600000 }`. Caps how much of a whole-codebase index WebChat delivers so it doesn't overflow the session window. Editable per provider from the in-panel Settings."
+          "markdownDescription": "Per-provider total character budget for one chat conversation, e.g. `{ \"chatgpt\": 800000, \"claude\": 600000 }`. LeechCode starts a fresh chat when ~90% of it is used, and caps how much of a whole-codebase index it delivers. Editable per provider from the in-panel Settings."
         },
         "webchat.index.chunked": {
           "type": "boolean",
@@ -224,6 +269,84 @@
           "maximum": 500,
           "description": "Safety cap on the number of messages used to deliver a chunked codebase index. Files beyond this many messages are skipped."
         },
+        "webchat.git.autoBranch": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Start each task on its own git branch (`leechcode/<task>`), so your own branch is untouched and the work can be reviewed or thrown away as a whole. If the working tree is dirty, LeechCode asks what to do first."
+        },
+        "webchat.git.autoCommit": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When a task branch is in use, commit each applied turn (only the files the agent changed) with a message from the model's summary. Makes every step recoverable with git, not just the in-memory undo."
+        },
+        "webchat.git.branchPrefix": {
+          "type": "string",
+          "default": "leechcode",
+          "description": "Prefix for task branches, e.g. \"leechcode\" → leechcode/add-login-form."
+        },
+        "webchat.review.provider": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Provider id used for second-opinion reviews (e.g. `claude` while `chatgpt` writes the code). Empty = pick another configured provider automatically. A model reviewing its own work is not useful."
+        },
+        "webchat.review.maxDiffChars": {
+          "type": "number",
+          "default": 40000,
+          "minimum": 2000,
+          "description": "Largest diff sent to a reviewer before it is truncated."
+        },
+        "webchat.privacy.redactSecrets": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "markdownDescription": "Never send credentials to a chat page. Files that exist to hold secrets (`.env*`, `*.pem`, `*.key`, `id_rsa`, `.npmrc`, `credentials`, keystores, service-account JSON) are not read at all, and anything that is sent — prompts, file context, command output, git diffs — is scanned so values that look like credentials (AWS/GitHub/OpenAI/Slack/Stripe tokens, JWTs, private keys, passwords in URLs, `SECRET=…` assignments) are masked. Placeholders and `process.env` lookups are left alone."
+        },
+        "webchat.request.timeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 15,
+          "maximum": 1800,
+          "description": "How long to wait without any feedback from the chat page before treating a request as failed (a closed tab or a stuck page would otherwise stall the task forever)."
+        },
+        "webchat.failover.mode": {
+          "type": "string",
+          "default": "off",
+          "enum": ["off", "safe", "always"],
+          "enumDescriptions": [
+            "Off: a failed request is only reported; you retry or switch provider yourself.",
+            "Safe: hand the task to another provider automatically, but only when the failure happened before the provider saw the prompt (nothing can be duplicated).",
+            "Always: also offer to continue after an ambiguous failure (the provider may already have edited files or run commands) — LeechCode asks first."
+          ],
+          "scope": "application",
+          "markdownDescription": "What to do when a request fails in the browser. A handover message is built locally (objective, files already changed, tool output, errors) because a provider's own chat history cannot be transferred."
+        },
+        "webchat.failover.providers": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string" },
+          "scope": "application",
+          "markdownDescription": "Ordered provider ids to try when failing over, e.g. `[\"chatgpt\", \"claude\", \"gemini\"]`. Empty = the current provider first, then the rest."
+        },
+        "webchat.customProviders": {
+          "type": "array",
+          "default": [],
+          "scope": "application",
+          "markdownDescription": "Extra web AI chat sites to drive, beyond the built-ins. Only `label` and `url` are required — the browser extension finds the input/send button/reply automatically, and you can fix a site by right-clicking an element → **WebChat Bridge**. Add sites from ⚙ Settings → Custom AI sites.",
+          "items": {
+            "type": "object",
+            "required": ["label", "url"],
+            "properties": {
+              "id": { "type": "string", "description": "Optional stable id (defaults to the hostname)." },
+              "label": { "type": "string", "description": "Name shown in the provider switcher." },
+              "url": { "type": "string", "description": "Chat page URL, e.g. https://chat.z.ai/ (https only; http allowed for localhost)." },
+              "inputSelector": { "type": "string", "description": "Optional CSS selector for the message box." },
+              "submitSelector": { "type": "string", "description": "Optional CSS selector for the Send button." },
+              "responseSelector": { "type": "string", "description": "Optional CSS selector matching each assistant reply." },
+              "maxMessageChars": { "type": "number", "description": "Per-message character limit (default 12000)." },
+              "maxSessionChars": { "type": "number", "description": "Per-conversation character budget (default 200000)." }
+            }
+          }
+        },
         "webchat.bridge.port": {
           "type": "number",
           "default": 53451,
@@ -233,8 +356,9 @@
         },
         "webchat.bridge.token": {
           "type": "string",
-          "default": "webchat-dev-token",
-          "description": "Shared local bridge token. Keep the browser extension token in sync."
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Advanced override for the bridge pairing token. Leave empty (recommended) to use the random per-install token kept in the OS keychain — copy it with **LeechCode: Copy Bridge Pairing Token**. Values shorter than 24 characters, or the old `webchat-dev-token`, are ignored."
         },
         "webchat.browser.autoSubmit": {
           "type": "boolean",
@@ -300,31 +424,31 @@
         },
         "webchat.session.maxContextTokens": {
           "type": "number",
-          "default": 150000,
+          "default": 1000000,
           "minimum": 1000,
-          "description": "Approximate total context-token budget for one web chat session before a fresh chat should be started."
+          "description": "Upper bound on the approximate token budget of one web chat before a fresh chat is started. Each provider's own conversation window (webchat.provider.maxSessionChars) caps it further."
         },
         "webchat.session.maxInputTokens": {
           "type": "number",
-          "default": 120000,
+          "default": 1000000,
           "minimum": 1000,
-          "description": "Approximate input-token budget for one web chat session."
+          "description": "Upper bound on the approximate input-token budget of one web chat (also capped by the provider's conversation window)."
         },
         "webchat.session.maxOutputTokens": {
           "type": "number",
-          "default": 30000,
+          "default": 400000,
           "minimum": 1000,
-          "description": "Approximate output-token budget for one web chat session."
+          "description": "Upper bound on the approximate output-token budget of one web chat (also capped by the provider's conversation window)."
         },
         "webchat.session.compactEveryPrompts": {
           "type": "number",
-          "default": 5,
+          "default": 10,
           "minimum": 1,
-          "description": "Ask the assistant for a compact development state after this many prompts."
+          "description": "Every N user prompts, also ask the assistant for a thorough compacted development state (the prompt itself is still sent)."
         },
         "webchat.session.rotateWhenBudgetRemainingBelow": {
           "type": "number",
-          "default": 0.15,
+          "default": 0.1,
           "minimum": 0.01,
           "maximum": 0.9,
           "description": "Start a fresh web chat when remaining session budget falls below this ratio."

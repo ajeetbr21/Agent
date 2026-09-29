@@ -14,6 +14,16 @@ Nothing here needs a rebuild of the IDE extension.
 
 ---
 
+## Quickest fix: right-click → WebChat Bridge
+
+No code needed: on the chat page, right-click the element LeechCode can't find → **WebChat Bridge** →
+*Use as chat input*, *Use as Send button* or *Use as assistant reply* (right-click any reply). The element
+flashes green and the selector is saved for that site in `chrome.storage.local`, tried before the built-in
+lists. See or reset saved picks on the extension's options page. Works for built-in and custom sites.
+
+To add a completely new site, use ⚙ Settings → **Custom AI sites** (see the README) — editing
+`content.js` is only needed for deeper, site-specific behaviour.
+
 ## The one thing to edit: the `providers` array
 
 Near the top of `content.js` is a `providers` array. Each entry is one chat site:
